@@ -1,6 +1,8 @@
 # BBOT TUI Viewer
 
-A self-contained terminal UI for browsing and analyzing BBOT scan results.
+A self-contained terminal UI for browsing and analyzing [BBOT](https://www.blacklanternsecurity.com/bbot/) scan results.
+
+![BBOT TUI Demo](docs/demo.gif)
 
 ## Features
 

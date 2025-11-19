@@ -1,0 +1,1505 @@
+#!/usr/bin/env python3
+"""
+BBOT TUI Viewer - Self-installing terminal-based interface for browsing BBOT scan results
+
+This script automatically sets up its own virtual environment and dependencies on first run.
+Simply copy this file to any server and run it - no other setup required!
+"""
+
+import sys
+import os
+from pathlib import Path
+
+# Required dependencies
+DEPENDENCIES = [
+    "textual>=0.47.0",
+    "rich>=13.0.0",
+]
+
+def setup_environment():
+    """Set up virtual environment and install dependencies"""
+    script_path = Path(__file__).resolve()
+    script_dir = script_path.parent
+    venv_dir = script_dir / ".bbot_viewer_venv"
+    marker_file = venv_dir / ".setup_complete"
+
+    # Check if setup is already complete
+    if marker_file.exists():
+        # Setup already done, just use the venv
+        if os.name == 'nt':  # Windows
+            venv_python = venv_dir / "Scripts" / "python.exe"
+        else:  # Unix/Linux/Mac
+            venv_python = venv_dir / "bin" / "python"
+
+        # Re-execute with venv python
+        os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
+
+    print("=" * 60)
+    print("BBOT Viewer - First Run Setup")
+    print("=" * 60)
+
+    # Create virtual environment
+    if not venv_dir.exists():
+        print(f"\n[1/3] Creating virtual environment at {venv_dir}")
+        import venv
+        venv.create(venv_dir, with_pip=True)
+        print("✓ Virtual environment created")
+
+    # Determine venv python path
+    if os.name == 'nt':  # Windows
+        venv_python = venv_dir / "Scripts" / "python.exe"
+        venv_pip = venv_dir / "Scripts" / "pip.exe"
+    else:  # Unix/Linux/Mac
+        venv_python = venv_dir / "bin" / "python"
+        venv_pip = venv_dir / "bin" / "pip"
+
+    # Upgrade pip and install dependencies
+    print("\n[2/3] Installing dependencies...")
+    import subprocess
+
+    # Upgrade pip quietly
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "-q", "--upgrade", "pip"],
+        check=True
+    )
+
+    # Install dependencies
+    for dep in DEPENDENCIES:
+        print(f"  - Installing {dep}")
+        subprocess.run(
+            [str(venv_pip), "install", "-q", dep],
+            check=True
+        )
+
+    print("✓ All dependencies installed")
+
+    # Create marker file to indicate setup is complete
+    marker_file.touch()
+
+    # Re-execute this script using the venv Python
+    print(f"\n[3/3] Launching BBOT Viewer...")
+    print("=" * 60 + "\n")
+
+    os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
+
+# Bootstrap: Check if we need to set up the environment
+if __name__ == "__main__":
+    script_path = Path(__file__).resolve()
+    script_dir = script_path.parent
+    venv_dir = script_dir / ".bbot_viewer_venv"
+    marker_file = venv_dir / ".setup_complete"
+
+    # Determine if we're running from the venv Python
+    if os.name == 'nt':  # Windows
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    else:  # Unix/Linux/Mac
+        venv_python = venv_dir / "bin" / "python"
+
+    is_venv_python = venv_python.exists() and Path(sys.executable).resolve() == venv_python.resolve()
+
+    # If marker doesn't exist, run full setup
+    if not marker_file.exists():
+        setup_environment()
+        sys.exit(0)  # Should never reach here due to execv, but just in case
+
+    # If marker exists but we're not running from venv, switch to venv
+    if marker_file.exists() and not is_venv_python:
+        os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
+
+    # If we reach here, we're in the venv and ready to run
+
+# ============================================================================
+# Main Application Code (runs only after environment is set up)
+# ============================================================================
+
+import json
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+from textual.app import App, ComposeResult
+from textual.containers import Container, Vertical, Horizontal, VerticalScroll
+from textual.widgets import (
+    Header,
+    Footer,
+    DataTable,
+    Static,
+    Button,
+    Input,
+    Label,
+    Tree,
+    TabbedContent,
+    TabPane,
+    Select,
+)
+from textual.widgets.tree import TreeNode
+from textual.binding import Binding
+from textual.reactive import reactive
+from textual.screen import Screen
+from rich.syntax import Syntax
+from rich.json import JSON
+from rich.table import Table as RichTable
+
+
+class ScanData:
+    """Parse and manage BBOT scan data"""
+
+    def __init__(self, scan_path: Path):
+        self.scan_path = scan_path
+        self.scan_name = scan_path.name
+        self.events: List[Dict[str, Any]] = []
+        self.scan_info: Dict[str, Any] = {}
+        self.preset_content: str = ""
+        self.load_events()
+        self.load_preset()
+
+    def load_events(self):
+        """Load events from output.json"""
+        json_file = self.scan_path / "output.json"
+        if not json_file.exists():
+            return
+
+        with open(json_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        event = json.loads(line)
+                        if event.get("type") == "SCAN":
+                            # Keep the first SCAN event (don't overwrite if already set)
+                            if not self.scan_info:
+                                self.scan_info = event
+                        else:
+                            self.events.append(event)
+                    except json.JSONDecodeError:
+                        continue
+
+    def load_preset(self):
+        """Load preset configuration from preset.yml"""
+        preset_file = self.scan_path / "preset.yml"
+        if preset_file.exists():
+            try:
+                with open(preset_file, 'r') as f:
+                    self.preset_content = f.read()
+            except Exception as e:
+                self.preset_content = f"Error loading preset: {e}"
+        else:
+            self.preset_content = "No preset.yml found in scan directory"
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Calculate statistics from events"""
+        event_types = {}
+        modules = {}
+        scope_distances = {}
+
+        for event in self.events:
+            event_type = event.get("type", "UNKNOWN")
+            module = event.get("module", "UNKNOWN")
+            scope_dist = event.get("scope_distance", 0)
+
+            event_types[event_type] = event_types.get(event_type, 0) + 1
+            modules[module] = modules.get(module, 0) + 1
+            scope_distances[scope_dist] = scope_distances.get(scope_dist, 0) + 1
+
+        return {
+            "total_events": len(self.events),
+            "event_types": event_types,
+            "modules": modules,
+            "scope_distances": scope_distances,
+            "scan_name": self.scan_name,
+            "started_at": self.scan_info.get("data", {}).get("started_at", "Unknown"),
+        }
+
+
+class StatisticsView(VerticalScroll):
+    """Display scan statistics with rich formatting"""
+
+    def __init__(self, scan_data: ScanData, **kwargs):
+        super().__init__(**kwargs)
+        self.scan_data = scan_data
+
+    def on_mount(self) -> None:
+        """Build statistics display on mount"""
+        stats = self.scan_data.get_statistics()
+
+        # Header section
+        header = f"[bold cyan]Scan Statistics[/bold cyan]\n"
+        header += f"[dim]Scan:[/dim] [yellow]{stats['scan_name']}[/yellow]\n"
+        header += f"[dim]Started:[/dim] {stats['started_at']}\n"
+        header += f"[dim]Total Events:[/dim] [bold green]{stats['total_events']:,}[/bold green]\n"
+        self.mount(Static(header))
+
+        # Event Types Table
+        event_table = RichTable(
+            title="📊 Event Types Distribution",
+            show_header=True,
+            header_style="bold magenta",
+            border_style="blue",
+            title_style="bold white"
+        )
+        event_table.add_column("Event Type", style="cyan", no_wrap=True)
+        event_table.add_column("Count", justify="right", style="green")
+        event_table.add_column("Percentage", justify="right", style="yellow")
+
+        total = stats['total_events']
+        for event_type, count in sorted(
+            stats["event_types"].items(), key=lambda x: x[1], reverse=True
+        ):
+            percentage = (count / total * 100) if total > 0 else 0
+            event_table.add_row(
+                event_type,
+                f"{count:,}",
+                f"{percentage:.1f}%"
+            )
+
+        self.mount(Static(event_table))
+
+        # Top Modules Table
+        module_table = RichTable(
+            title="🔧 Top 15 Modules",
+            show_header=True,
+            header_style="bold magenta",
+            border_style="green",
+            title_style="bold white"
+        )
+        module_table.add_column("Rank", style="dim", width=6)
+        module_table.add_column("Module", style="cyan")
+        module_table.add_column("Events", justify="right", style="green")
+        module_table.add_column("Percentage", justify="right", style="yellow")
+
+        for idx, (module, count) in enumerate(sorted(
+            stats["modules"].items(), key=lambda x: x[1], reverse=True
+        )[:15], 1):
+            percentage = (count / total * 100) if total > 0 else 0
+            rank_style = "bold red" if idx == 1 else "bold yellow" if idx == 2 else "bold white" if idx == 3 else "dim"
+            module_table.add_row(
+                f"#{idx}",
+                module,
+                f"{count:,}",
+                f"{percentage:.1f}%"
+            )
+
+        self.mount(Static(module_table))
+
+        # Scope Distance Table
+        scope_table = RichTable(
+            title="🎯 Scope Distance Distribution",
+            show_header=True,
+            header_style="bold magenta",
+            border_style="yellow",
+            title_style="bold white"
+        )
+        scope_table.add_column("Distance", style="cyan", justify="center")
+        scope_table.add_column("Events", justify="right", style="green")
+        scope_table.add_column("Percentage", justify="right", style="yellow")
+        scope_table.add_column("Bar", style="blue")
+
+        for scope_dist, count in sorted(stats["scope_distances"].items()):
+            percentage = (count / total * 100) if total > 0 else 0
+            bar_length = int(percentage / 2)  # Scale to max 50 chars
+            bar = "█" * bar_length
+            scope_table.add_row(
+                str(scope_dist),
+                f"{count:,}",
+                f"{percentage:.1f}%",
+                bar
+            )
+
+        self.mount(Static(scope_table))
+
+
+class PresetView(Static):
+    """Display preset configuration"""
+
+    def __init__(self, scan_data: ScanData, **kwargs):
+        super().__init__(**kwargs)
+        self.scan_data = scan_data
+
+    def on_mount(self) -> None:
+        """Update content when mounted"""
+        if self.scan_data.preset_content:
+            syntax = Syntax(
+                self.scan_data.preset_content,
+                "yaml",
+                theme="monokai",
+                line_numbers=True,
+                word_wrap=False
+            )
+            self.update(syntax)
+        else:
+            self.update("No preset configuration available")
+
+
+class FindingsTable(DataTable):
+    """DataTable for displaying vulnerability and finding events"""
+
+    def __init__(self, scan_data: ScanData, **kwargs):
+        super().__init__(**kwargs)
+        self.scan_data = scan_data
+        # Include both VULNERABILITY and FINDING types
+        self.findings = [
+            e for e in scan_data.events
+            if e.get("type") in ["VULNERABILITY", "FINDING"]
+        ]
+        self.cursor_type = "row"
+
+    def on_mount(self) -> None:
+        """Set up the findings table"""
+        self.add_columns("Type", "Severity", "Host", "Description", "URL", "Module")
+
+        for finding in self.findings:
+            data = finding.get("data", {})
+            event_type = finding.get("type", "")
+
+            # VULNERABILITY has severity, FINDING doesn't
+            if event_type == "VULNERABILITY":
+                severity = data.get("severity", "UNKNOWN")
+            else:  # FINDING
+                severity = "INFO"
+
+            host = data.get("host", "")
+            description = data.get("description", "")[:70]  # Truncate
+            url = data.get("url", "")[:40]  # Truncate
+            module = finding.get("module", "")
+
+            self.add_row(event_type, severity, host, description, url, module)
+
+    def on_key(self, event) -> None:
+        """Handle key events for wraparound navigation"""
+        if event.key == "down" or event.key == "j":
+            if self.cursor_row == self.row_count - 1:
+                self.move_cursor(row=0)
+                event.stop()
+        elif event.key == "up" or event.key == "k":
+            if self.cursor_row == 0:
+                self.move_cursor(row=self.row_count - 1)
+                event.stop()
+
+
+class FindingDetailView(VerticalScroll):
+    """Display formatted view of selected finding"""
+
+    finding_json = reactive({})
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def watch_finding_json(self, finding_json: Dict[str, Any]) -> None:
+        """React to finding selection changes"""
+        self.update_content(finding_json)
+
+    def update_content(self, finding_json: Dict[str, Any]) -> None:
+        """Update the displayed finding details with formatted output"""
+        # Remove all existing children
+        self.remove_children()
+
+        if not finding_json:
+            self.mount(Static("Select a finding to view details"))
+            return
+
+        # Extract key information
+        event_type = finding_json.get("type", "UNKNOWN")
+        data = finding_json.get("data", {})
+
+        # Build plain text content (no Markdown, no special formatting)
+        content = f"{event_type}\n\n"
+
+        # Severity (VULNERABILITY only)
+        if event_type == "VULNERABILITY":
+            severity = data.get("severity", "UNKNOWN")
+            content += f"Severity: {severity}\n\n"
+
+        # Host and URL
+        host = data.get("host", finding_json.get("host", "N/A"))
+        content += f"Host: {host}\n"
+
+        url = data.get("url", "N/A")
+        content += f"URL: {url}\n\n"
+
+        # Description (main finding)
+        description = data.get("description", "No description available")
+        content += f"Description:\n{description}\n\n"
+
+        # Module information
+        module = finding_json.get("module", "N/A")
+        module_sequence = finding_json.get("module_sequence", "N/A")
+        content += f"Module: {module}\n"
+        content += f"Module Sequence: {module_sequence}\n\n"
+
+        # Discovery context
+        discovery_context = finding_json.get("discovery_context", "")
+        if discovery_context:
+            content += f"Discovery Context:\n{discovery_context}\n\n"
+
+        # Discovery path
+        discovery_path = finding_json.get("discovery_path", [])
+        if discovery_path:
+            content += f"Discovery Path:\n"
+            for i, step in enumerate(discovery_path, 1):
+                content += f"{i}. {step}\n"
+            content += "\n"
+
+        # Tags
+        tags = finding_json.get("tags", [])
+        if tags:
+            content += f"Tags: {', '.join(str(t) for t in tags)}\n\n"
+
+        # Timestamp
+        timestamp = finding_json.get("timestamp", "N/A")
+        content += f"Timestamp: {timestamp}\n\n"
+
+        # Additional metadata
+        resolved_hosts = finding_json.get("resolved_hosts", [])
+        if resolved_hosts:
+            content += f"Resolved IPs: {', '.join(str(h) for h in resolved_hosts)}\n"
+
+        port = finding_json.get("port")
+        if port:
+            content += f"Port: {port}\n"
+
+        # Disable markdown parsing to preserve all special characters
+        self.mount(Static(content, markup=False))
+
+
+class EventTable(DataTable):
+    """DataTable for displaying events"""
+
+    def __init__(self, scan_data: ScanData, **kwargs):
+        super().__init__(**kwargs)
+        self.scan_data = scan_data
+        self.filtered_events = scan_data.events
+        self.cursor_type = "row"
+
+    def on_mount(self) -> None:
+        """Set up the table when mounted"""
+        self.add_columns("Type", "Data", "Module", "Scope", "Timestamp")
+        self.refresh_table()
+
+    def on_key(self, event) -> None:
+        """Handle key events for wraparound navigation"""
+        if event.key == "down" or event.key == "j":
+            if self.cursor_row == self.row_count - 1:
+                self.move_cursor(row=0)
+                event.stop()
+        elif event.key == "up" or event.key == "k":
+            if self.cursor_row == 0:
+                self.move_cursor(row=self.row_count - 1)
+                event.stop()
+
+    def refresh_table(self, event_type_filter: str = None, scope_distance_filter: int = None):
+        """Refresh table with optional filters"""
+        self.clear()
+
+        # Start with all events
+        filtered = self.scan_data.events
+
+        # Apply type filter
+        if event_type_filter and event_type_filter != "All":
+            filtered = [e for e in filtered if e.get("type") == event_type_filter]
+
+        # Apply scope distance filter (now accepts integer for max scope distance)
+        if scope_distance_filter is not None:
+            filtered = [e for e in filtered if e.get("scope_distance", 0) <= scope_distance_filter]
+
+        self.filtered_events = filtered
+
+        for event in self.filtered_events[:1000]:  # Limit to first 1000 for performance
+            event_type = event.get("type", "")
+            data = str(event.get("data", ""))[:50]  # Truncate long data
+            module = event.get("module", "")
+            scope = str(event.get("scope_distance", ""))
+            timestamp = event.get("timestamp", "")
+
+            if timestamp:
+                try:
+                    # Try to parse and format timestamp
+                    if isinstance(timestamp, str):
+                        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        timestamp = dt.strftime("%H:%M:%S")
+                except:
+                    timestamp = str(timestamp)[:10]
+
+            self.add_row(event_type, data, module, scope, timestamp)
+
+
+class EventDetailView(VerticalScroll):
+    """Display detailed view of selected event"""
+
+    event_json = reactive({})
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def watch_event_json(self, event_json: Dict[str, Any]) -> None:
+        """React to event selection changes"""
+        self.update_content(event_json)
+
+    def update_content(self, event_json: Dict[str, Any]) -> None:
+        """Update the displayed event details"""
+        # Remove all existing children
+        self.remove_children()
+
+        if not event_json:
+            self.mount(Static("Select an event to view details"))
+            return
+
+        json_str = json.dumps(event_json, indent=2)
+        syntax = Syntax(json_str, "json", theme="monokai", line_numbers=True)
+        self.mount(Static(syntax))
+
+
+class DiscoveryTree(Tree):
+    """Tree widget showing event discovery hierarchy"""
+
+    def __init__(self, scan_data: ScanData, **kwargs):
+        super().__init__("Discovery", **kwargs)
+        self.scan_data = scan_data
+        self.uuid_to_event = {}
+        self.uuid_to_node = {}
+        self.view_mode = "discovery"  # "discovery" or "topology"
+        self.type_filter = None  # Filter by event type
+        self.scope_filter = None  # Filter by max scope distance
+
+    def on_mount(self) -> None:
+        """Build the tree when mounted"""
+        self.build_tree()
+
+    def switch_mode(self, mode: str) -> None:
+        """Switch between discovery and topology modes, preserving filters"""
+        self.view_mode = mode
+        # Preserve current filters when switching modes
+        self.clear()
+        self.uuid_to_event = {}
+        self.uuid_to_node = {}
+        self.build_tree()
+
+    def rebuild_tree(self, type_filter: str = None, scope_filter: int = None) -> None:
+        """Clear and rebuild the tree with updated filters"""
+        self.type_filter = type_filter
+        self.scope_filter = scope_filter
+        self.clear()
+        self.uuid_to_event = {}
+        self.uuid_to_node = {}
+        self.build_tree()
+
+    def build_tree(self) -> None:
+        """Build the tree based on current view mode"""
+        if self.view_mode == "discovery":
+            self._build_discovery_tree()
+        else:
+            self._build_topology_tree()
+
+        # Expand root by default
+        self.root.expand()
+
+    def _filter_event(self, event: Dict[str, Any]) -> bool:
+        """Check if event passes current filters"""
+        # Apply type filter
+        if self.type_filter and self.type_filter != "All":
+            if event.get("type") != self.type_filter:
+                return False
+
+        # Apply scope distance filter
+        if self.scope_filter is not None:
+            if event.get("scope_distance", 0) > self.scope_filter:
+                return False
+
+        return True
+
+    def _build_discovery_tree(self) -> None:
+        """Build discovery tree based on parent_uuid relationships"""
+        uuid_to_children = {}
+
+        # Get SCAN uuid from scan_info
+        scan_uuid = self.scan_data.scan_info.get("uuid")
+
+        # Index all events by parent (only include events that pass filter)
+        for event in self.scan_data.events:
+            if not self._filter_event(event):
+                continue
+
+            event_uuid = event.get("uuid")
+            self.uuid_to_event[event_uuid] = event
+            parent_uuid = event.get("parent_uuid")
+
+            if parent_uuid not in uuid_to_children:
+                uuid_to_children[parent_uuid] = []
+            uuid_to_children[parent_uuid].append(event)
+
+        # Build tree starting from SCAN's children (skip SCAN itself)
+        if scan_uuid and scan_uuid in uuid_to_children:
+            root_events = uuid_to_children[scan_uuid]
+            for event in root_events:
+                self._add_event_node(self.root, event, uuid_to_children)
+
+    def _build_topology_tree(self) -> None:
+        """Build topology tree based on logical network hierarchy"""
+        # Group events by type and host
+        ip_ranges = []
+        ip_addresses = {}     # keyed by IP
+        dns_names = {}        # keyed by DNS name
+        hosts = {}            # keyed by host - stores URLs, ports, findings
+        http_responses = {}   # keyed by URL
+        web_parameters = {}   # keyed by parent URL
+        technologies = {}     # keyed by host
+        others = []
+
+        for event in self.scan_data.events:
+            # Skip events that don't pass filter
+            if not self._filter_event(event):
+                continue
+            event_type = event.get("type")
+            host = event.get("host", "")
+
+            if event_type == "IP_RANGE":
+                ip_ranges.append(event)
+            elif event_type == "IP_ADDRESS":
+                ip = event.get("data")
+                if ip not in ip_addresses:
+                    ip_addresses[ip] = event
+            elif event_type == "DNS_NAME":
+                dns_name = event.get("data", "")
+                if dns_name not in dns_names:
+                    dns_names[dns_name] = event
+            elif event_type == "OPEN_TCP_PORT":
+                if host not in hosts:
+                    hosts[host] = {"ports": [], "urls": [], "findings": [], "tech": []}
+                hosts[host]["ports"].append(event)
+            elif event_type in ["URL", "URL_UNVERIFIED"]:
+                if host not in hosts:
+                    hosts[host] = {"ports": [], "urls": [], "findings": [], "tech": []}
+                hosts[host]["urls"].append(event)
+            elif event_type in ["VULNERABILITY", "FINDING"]:
+                if host not in hosts:
+                    hosts[host] = {"ports": [], "urls": [], "findings": [], "tech": []}
+                hosts[host]["findings"].append(event)
+            elif event_type == "HTTP_RESPONSE":
+                # Group HTTP responses under their URL
+                parent_url = event.get("parent")
+                if parent_url:
+                    if parent_url not in http_responses:
+                        http_responses[parent_url] = []
+                    http_responses[parent_url].append(event)
+            elif event_type == "WEB_PARAMETER":
+                # Group web parameters under their parent URL
+                parent = event.get("parent")
+                if parent:
+                    if parent not in web_parameters:
+                        web_parameters[parent] = []
+                    web_parameters[parent].append(event)
+            elif event_type == "TECHNOLOGY":
+                if host not in hosts:
+                    hosts[host] = {"ports": [], "urls": [], "findings": [], "tech": []}
+                hosts[host]["tech"].append(event)
+            else:
+                others.append(event)
+
+        # Build tree structure
+
+        # 1. IP Ranges and IPs
+        if ip_ranges:
+            for ip_range in ip_ranges:
+                range_label = f"IP_RANGE: {ip_range.get('data', '')}"
+                range_node = self.root.add(range_label, data=ip_range)
+                self.uuid_to_event[ip_range.get('uuid')] = ip_range
+
+                # Add IPs under range that have associated data
+                for ip, ip_event in sorted(ip_addresses.items()):
+                    if ip in hosts:  # Only show IPs that have ports/URLs/findings
+                        ip_node = range_node.add(f"IP_ADDRESS: {ip}", data=ip_event)
+                        self._build_host_subtree(ip_node, ip, hosts.get(ip, {}))
+                        ip_node.expand()
+
+                range_node.expand()
+
+        # 2. DNS Names with hierarchy
+        if dns_names:
+            # Build DNS hierarchy (parent domains with subdomains)
+            root_domains = {}
+            for dns_name, event in dns_names.items():
+                parts = dns_name.split(".")
+                if len(parts) >= 2:
+                    root_domain = ".".join(parts[-2:])  # e.g., "example.com"
+                    if root_domain not in root_domains:
+                        root_domains[root_domain] = []
+                    root_domains[root_domain].append((dns_name, event))
+
+            for root_domain, names in sorted(root_domains.items()):
+                # Create root domain node
+                root_names = [n for n in names if n[0] == root_domain]
+                if root_names:
+                    root_event = root_names[0][1]
+                    domain_node = self.root.add(f"DNS_NAME: {root_domain}", data=root_event)
+
+                    # Add subdomains
+                    subdomains = [n for n in names if n[0] != root_domain]
+                    for subdomain, event in sorted(subdomains):
+                        sub_node = domain_node.add(f"DNS_NAME: {subdomain}", data=event)
+
+                    domain_node.expand()
+
+        # 3. Hosts (domains/IPs) with their URLs, ports, and findings
+        for host in sorted(hosts.keys()):
+            # Skip if already added under IP_RANGE
+            if host in ip_addresses:
+                continue
+
+            host_node = self.root.add(f"Host: {host}")
+            self._build_host_subtree(host_node, host, hosts[host])
+            host_node.expand()
+
+        # 4. Other events
+        if others:
+            other_node = self.root.add("Other Events")
+            for event in others:
+                self._add_simple_node(other_node, event)
+            other_node.expand()
+
+    def _build_host_subtree(self, parent_node: TreeNode, host: str, host_data: dict) -> None:
+        """Build subtree for a host with ports, URLs, and findings"""
+        # Add ports
+        for port_event in sorted(host_data.get("ports", []), key=lambda e: e.get("port", 0)):
+            self._add_simple_node(parent_node, port_event)
+
+        # Add technologies
+        for tech_event in host_data.get("tech", []):
+            self._add_simple_node(parent_node, tech_event)
+
+        # Add URLs with their findings
+        for url_event in sorted(host_data.get("urls", []), key=lambda e: e.get("data", "")):
+            url_node = self._add_simple_node(parent_node, url_event)
+
+            # Check if this URL has findings
+            url_data = url_event.get("data", "")
+            for finding in host_data.get("findings", []):
+                finding_url = finding.get("data", {}).get("url", "")
+                if finding_url == url_data:
+                    self._add_simple_node(url_node, finding)
+                    url_node.expand()
+
+        # Add findings not associated with specific URLs
+        for finding in host_data.get("findings", []):
+            finding_url = finding.get("data", {}).get("url", "")
+            # Only add if not already added under a URL
+            if not finding_url or not any(u.get("data") == finding_url for u in host_data.get("urls", [])):
+                self._add_simple_node(parent_node, finding)
+
+    def _add_event_node(self, parent_node: TreeNode, event: Dict[str, Any],
+                       uuid_to_children: Dict[str, List[Dict[str, Any]]]) -> TreeNode:
+        """Recursively add event nodes to the tree (for discovery mode)"""
+        event_uuid = event.get("uuid")
+        event_type = event.get("type")
+        data = event.get("data", "")
+
+        # Format label based on event type
+        if event_type == "VULNERABILITY":
+            severity = event.get("data", {}).get("severity", "")
+            label = f"⚠️  {event_type}: {severity} - {str(data)[:60]}"
+        elif event_type == "FINDING":
+            label = f"🔍 {event_type}: {str(data)[:60]}"
+        else:
+            label = f"{event_type}: {str(data)[:60]}"
+
+        # Add node
+        node = parent_node.add(label, data=event)
+        self.uuid_to_node[event_uuid] = node
+
+        # Add children recursively
+        if event_uuid in uuid_to_children:
+            children = uuid_to_children[event_uuid]
+            for child in children:
+                self._add_event_node(node, child, uuid_to_children)
+            # Expand node if it has children
+            node.expand()
+
+        return node
+
+    def _add_simple_node(self, parent_node: TreeNode, event: Dict[str, Any]) -> TreeNode:
+        """Add a simple node without recursion (for topology mode)"""
+        event_uuid = event.get("uuid")
+        event_type = event.get("type")
+        data = event.get("data", "")
+
+        # Format label based on event type
+        if event_type == "VULNERABILITY":
+            severity = event.get("data", {}).get("severity", "")
+            label = f"⚠️  {event_type}: {severity} - {str(data)[:60]}"
+        elif event_type == "FINDING":
+            label = f"🔍 {event_type}: {str(data)[:60]}"
+        else:
+            label = f"{event_type}: {str(data)[:60]}"
+
+        # Add node
+        node = parent_node.add(label, data=event)
+        self.uuid_to_event[event_uuid] = event
+        self.uuid_to_node[event_uuid] = node
+
+        return node
+
+
+class TreeDetailView(VerticalScroll):
+    """Display detailed view of selected tree node"""
+
+    event_json = reactive({})
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def watch_event_json(self, event_json: Dict[str, Any]) -> None:
+        """React to event selection changes"""
+        self.update_content(event_json)
+
+    def update_content(self, event_json: Dict[str, Any]) -> None:
+        """Update the displayed event details"""
+        # Remove all existing children
+        self.remove_children()
+
+        if not event_json:
+            self.mount(Static("Select a node to view details"))
+            return
+
+        json_str = json.dumps(event_json, indent=2)
+        syntax = Syntax(json_str, "json", theme="monokai", line_numbers=True)
+        self.mount(Static(syntax))
+
+
+class ScanListScreen(Screen):
+    """Screen to select a scan from a list"""
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("escape", "quit", "Quit"),
+    ]
+
+    def __init__(self, scans_dir: Path):
+        super().__init__()
+        self.scans_dir = scans_dir
+        self.scans = self.discover_scans()
+
+    def discover_scans(self) -> List[Dict[str, Any]]:
+        """Discover all scan directories"""
+        scans = []
+
+        for scan_dir in sorted(self.scans_dir.iterdir()):
+            if not scan_dir.is_dir() or scan_dir.name.startswith('.'):
+                continue
+
+            output_json = scan_dir / "output.json"
+            if not output_json.exists():
+                continue
+
+            # Get scan metadata
+            event_count = 0
+            finding_count = 0
+            modified_time = "Unknown"
+
+            try:
+                with open(output_json, 'r') as f:
+                    for line in f:
+                        try:
+                            event = json.loads(line.strip())
+                            if event.get("type") != "SCAN":
+                                event_count += 1
+                            if event.get("type") in ["VULNERABILITY", "FINDING"]:
+                                finding_count += 1
+                        except:
+                            continue
+
+                stat = output_json.stat()
+                modified_time = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+
+            scans.append({
+                "name": scan_dir.name,
+                "path": scan_dir,
+                "event_count": event_count,
+                "finding_count": finding_count,
+                "modified": modified_time,
+            })
+
+        return scans
+
+    def compose(self) -> ComposeResult:
+        """Create the scan list UI"""
+        yield Header()
+
+        # Calculate total findings
+        total_findings = sum(scan["finding_count"] for scan in self.scans)
+        findings_text = f" ({total_findings} findings)" if total_findings > 0 else ""
+
+        with Vertical():
+            yield Static(
+                f"# Select a Scan\n\nFound {len(self.scans)} scans{findings_text} in {self.scans_dir}\n",
+                id="header"
+            )
+            yield DataTable(id="scan-table")
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        """Set up the scan table"""
+        table = self.query_one("#scan-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Scan Name", "Events", "Findings", "Last Modified")
+
+        for scan in self.scans:
+            # Format findings count with highlighting if > 0
+            findings_str = str(scan["finding_count"])
+            if scan["finding_count"] > 0:
+                findings_str = f"⚠ {findings_str}"
+
+            table.add_row(
+                scan["name"],
+                str(scan["event_count"]),
+                findings_str,
+                scan["modified"],
+            )
+
+    def on_key(self, event) -> None:
+        """Handle key events for wraparound navigation in scan list"""
+        table = self.query_one("#scan-table", DataTable)
+        if event.key == "down" or event.key == "j":
+            if table.cursor_row == table.row_count - 1:
+                table.move_cursor(row=0)
+                event.stop()
+        elif event.key == "up" or event.key == "k":
+            if table.cursor_row == 0:
+                table.move_cursor(row=table.row_count - 1)
+                event.stop()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle scan selection"""
+        if event.cursor_row < len(self.scans):
+            selected_scan = self.scans[event.cursor_row]
+            self.app.push_screen(ScanViewerScreen(selected_scan["path"]))
+
+
+class ScanViewerScreen(Screen):
+    """Screen to view a single scan"""
+
+    BINDINGS = [
+        Binding("q", "quit_viewer", "Back to List"),
+        Binding("escape", "quit_viewer", "Back to List"),
+        Binding("f", "focus_filter", "Filter"),
+        Binding("left", "adjust_split_left", "Split ←"),
+        Binding("right", "adjust_split_right", "Split →"),
+    ]
+
+    split_ratio = reactive(60)  # Default 60% for main panel
+
+    def __init__(self, scan_path: Path):
+        super().__init__()
+        self.scan_data = ScanData(scan_path)
+        self.current_type_filter = "All"
+        self.current_scope_filter = None  # None means "all"
+        self.tree_type_filter = "All"
+        self.tree_scope_filter = None  # None means "all"
+
+    def compose(self) -> ComposeResult:
+        """Create the scan viewer UI"""
+        yield Header()
+
+        # Get unique event types for filter
+        event_types = ["All"] + sorted(
+            list(set(e.get("type", "") for e in self.scan_data.events))
+        )
+
+        # Count vulnerabilities and findings for the tab label
+        finding_count = len([
+            e for e in self.scan_data.events
+            if e.get("type") in ["VULNERABILITY", "FINDING"]
+        ])
+        findings_label = f"Findings ({finding_count})" if finding_count > 0 else "Findings"
+
+        with TabbedContent(initial="findings"):
+            with TabPane(findings_label, id="findings"):
+                with Horizontal(id="findings-pane"):
+                    with Vertical(id="findings-container"):
+                        yield FindingsTable(self.scan_data, id="findings-table")
+
+                    with Vertical(id="finding-detail-container"):
+                        yield FindingDetailView(id="finding-detail")
+
+            with TabPane("Events", id="events"):
+                with Horizontal(id="events-pane"):
+                    with Vertical(id="main-container"):
+                        with Horizontal(id="filter-container"):
+                            with Vertical(id="event-type-col"):
+                                yield Label("Type:")
+                                yield Select(
+                                    [(t, t) for t in event_types],
+                                    value="All",
+                                    allow_blank=False,
+                                    id="event-type-filter",
+                                )
+                            with Vertical(id="event-scope-col"):
+                                yield Label("Scope:")
+                                yield Input(placeholder="all", id="scope-distance-input")
+                            with Vertical(id="event-search-col"):
+                                yield Label("Search (data, tags, module, host):")
+                                yield Input(placeholder="space separates terms...", id="search-input")
+                        yield EventTable(self.scan_data, id="event-table")
+
+                    with Vertical(id="detail-container"):
+                        yield EventDetailView(id="event-detail")
+
+            with TabPane("Tree", id="tree-tab"):
+                with Horizontal(id="tree-pane"):
+                    with Vertical(id="tree-container"):
+                        with Horizontal(id="tree-filter-container"):
+                            with Vertical(id="tree-mode-col"):
+                                yield Label("View mode:")
+                                yield Select(
+                                    [("Discovery", "discovery"), ("Topology", "topology")],
+                                    value="discovery",
+                                    allow_blank=False,
+                                    id="tree-mode-select",
+                                )
+                            with Vertical(id="tree-type-col"):
+                                yield Label("Type:")
+                                yield Select(
+                                    [(t, t) for t in event_types],
+                                    value="All",
+                                    allow_blank=False,
+                                    id="tree-type-filter",
+                                )
+                            with Vertical(id="tree-scope-col"):
+                                yield Label("Scope:")
+                                yield Input(placeholder="all", id="tree-scope-input")
+                        yield DiscoveryTree(self.scan_data, id="discovery-tree")
+
+                    with Vertical(id="tree-detail-container"):
+                        yield TreeDetailView(id="tree-detail")
+
+            with TabPane("Statistics", id="stats-tab"):
+                yield StatisticsView(self.scan_data)
+
+            with TabPane("Scan Preset", id="config-tab"):
+                # Create syntax highlighted content directly
+                if self.scan_data.preset_content:
+                    syntax = Syntax(
+                        self.scan_data.preset_content,
+                        "yaml",
+                        theme="monokai",
+                        line_numbers=True,
+                        word_wrap=False
+                    )
+                    yield VerticalScroll(Static(syntax))
+                else:
+                    yield Static("No preset configuration available")
+
+        yield Footer()
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Handle row highlight (navigation) in tables"""
+        # Check which table triggered the event
+        if event.data_table.id == "findings-table":
+            table = self.query_one("#findings-table", FindingsTable)
+            row_index = event.cursor_row
+
+            if row_index < len(table.findings):
+                selected_finding = table.findings[row_index]
+                detail_view = self.query_one("#finding-detail", FindingDetailView)
+                detail_view.finding_json = selected_finding
+
+        elif event.data_table.id == "event-table":
+            table = self.query_one("#event-table", EventTable)
+            row_index = event.cursor_row
+
+            if row_index < len(table.filtered_events):
+                selected_event = table.filtered_events[row_index]
+                detail_view = self.query_one("#event-detail", EventDetailView)
+                detail_view.event_json = selected_event
+
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        """Handle tree node highlight (navigation)"""
+        node = event.node
+        if node.data:  # Node has event data attached
+            detail_view = self.query_one("#tree-detail", TreeDetailView)
+            detail_view.event_json = node.data
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Handle filter selection change"""
+        if event.select.id == "event-type-filter":
+            self.current_type_filter = event.value
+            table = self.query_one("#event-table", EventTable)
+            table.refresh_table(self.current_type_filter, self.current_scope_filter)
+        elif event.select.id == "tree-mode-select":
+            tree = self.query_one("#discovery-tree", DiscoveryTree)
+            tree.switch_mode(event.value)
+        elif event.select.id == "tree-type-filter":
+            self.tree_type_filter = event.value
+            tree = self.query_one("#discovery-tree", DiscoveryTree)
+            tree.rebuild_tree(self.tree_type_filter, self.tree_scope_filter)
+
+    def _match_search_term(self, event: Dict[str, Any], term: str) -> bool:
+        """Check if a single search term matches any field in the event"""
+        term_lower = term.lower()
+
+        # Fields to search
+        searchable_fields = [
+            str(event.get("data", "")),
+            str(event.get("type", "")),
+            str(event.get("module", "")),
+            str(event.get("host", "")),
+            str(event.get("discovery_context", "")),
+        ]
+
+        # Add all tags
+        for tag in event.get("tags", []):
+            searchable_fields.append(str(tag))
+
+        # Check if term appears in any field
+        return any(term_lower in field.lower() for field in searchable_fields)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle search input with multi-term support"""
+        if event.input.id == "search-input":
+            search_input = event.value.strip()
+            table = self.query_one("#event-table", EventTable)
+
+            if search_input:
+                # Split by whitespace to get multiple search terms
+                search_terms = search_input.split()
+
+                # Filter: event matches if ALL terms match (AND logic)
+                table.filtered_events = [
+                    e
+                    for e in table.scan_data.events
+                    if all(self._match_search_term(e, term) for term in search_terms)
+                ]
+            else:
+                table.filtered_events = table.scan_data.events
+
+            table.clear()
+            for evt in table.filtered_events[:1000]:
+                event_type = evt.get("type", "")
+                data = str(evt.get("data", ""))[:50]
+                module = evt.get("module", "")
+                scope = str(evt.get("scope_distance", ""))
+                timestamp = str(evt.get("timestamp", ""))[:10]
+                table.add_row(event_type, data, module, scope, timestamp)
+        elif event.input.id == "scope-distance-input":
+            value = event.value.strip()
+            if value and value.isdigit():
+                self.current_scope_filter = int(value)
+            else:
+                self.current_scope_filter = None  # "all"
+            table = self.query_one("#event-table", EventTable)
+            table.refresh_table(self.current_type_filter, self.current_scope_filter)
+        elif event.input.id == "tree-scope-input":
+            value = event.value.strip()
+            if value and value.isdigit():
+                self.tree_scope_filter = int(value)
+            else:
+                self.tree_scope_filter = None  # "all"
+            tree = self.query_one("#discovery-tree", DiscoveryTree)
+            tree.rebuild_tree(self.tree_type_filter, self.tree_scope_filter)
+
+    def action_focus_filter(self) -> None:
+        """Focus the search input"""
+        self.query_one("#search-input", Input).focus()
+
+    def action_quit_viewer(self) -> None:
+        """Return to scan list"""
+        self.app.pop_screen()
+
+    def action_adjust_split_left(self) -> None:
+        """Decrease main panel width (increase detail panel)"""
+        if self.split_ratio > 30:
+            self.split_ratio -= 5
+            self.update_split()
+
+    def action_adjust_split_right(self) -> None:
+        """Increase main panel width (decrease detail panel)"""
+        if self.split_ratio < 80:
+            self.split_ratio += 5
+            self.update_split()
+
+    def update_split(self) -> None:
+        """Update the split ratio dynamically"""
+        # Update findings pane
+        try:
+            findings_container = self.query_one("#findings-container")
+            findings_container.styles.width = f"{self.split_ratio}%"
+
+            detail_container = self.query_one("#finding-detail-container")
+            detail_container.styles.width = f"{100 - self.split_ratio}%"
+        except:
+            pass
+
+        # Update events pane
+        try:
+            main_container = self.query_one("#main-container")
+            main_container.styles.width = f"{self.split_ratio}%"
+
+            event_detail = self.query_one("#detail-container")
+            event_detail.styles.width = f"{100 - self.split_ratio}%"
+        except:
+            pass
+
+        # Update tree pane
+        try:
+            tree_container = self.query_one("#tree-container")
+            tree_container.styles.width = f"{self.split_ratio}%"
+
+            tree_detail = self.query_one("#tree-detail-container")
+            tree_detail.styles.width = f"{100 - self.split_ratio}%"
+        except:
+            pass
+
+
+class BBotViewer(App):
+    """Main BBOT Viewer application"""
+
+    CSS = """
+    #findings-pane {
+        layout: horizontal;
+    }
+
+    #findings-container {
+        width: 60%;
+        height: 100%;
+    }
+
+    #finding-detail-container {
+        width: 40%;
+        height: 100%;
+        border-left: solid $accent;
+    }
+
+    FindingsTable {
+        height: 1fr;
+    }
+
+    FindingDetailView {
+        height: 100%;
+        overflow-y: auto;
+        padding: 1;
+    }
+
+    #events-pane {
+        layout: horizontal;
+    }
+
+    #main-container {
+        width: 60%;
+        height: 100%;
+    }
+
+    #detail-container {
+        width: 40%;
+        height: 100%;
+        border-left: solid $accent;
+    }
+
+    #filter-container {
+        height: auto;
+        padding: 1;
+        background: $panel;
+    }
+
+    #event-type-col {
+        height: auto;
+        width: auto;
+        margin-right: 2;
+    }
+
+    #event-type-filter {
+        width: 20;
+    }
+
+    #event-scope-col {
+        height: auto;
+        width: auto;
+        margin-right: 2;
+    }
+
+    #scope-distance-input {
+        width: 15;
+    }
+
+    #event-search-col {
+        height: auto;
+        width: 1fr;
+    }
+
+    #search-input {
+        width: 1fr;
+    }
+
+    EventTable {
+        height: 1fr;
+    }
+
+    EventDetailView {
+        height: 100%;
+        overflow-y: auto;
+    }
+
+    #tree-pane {
+        layout: horizontal;
+    }
+
+    #tree-container {
+        width: 60%;
+        height: 100%;
+    }
+
+    #tree-filter-container {
+        height: auto;
+        padding: 1;
+        background: $panel;
+    }
+
+    #tree-mode-col {
+        height: auto;
+        width: auto;
+        margin-right: 2;
+    }
+
+    #tree-mode-select {
+        width: 20;
+    }
+
+    #tree-type-col {
+        height: auto;
+        width: auto;
+        margin-right: 2;
+    }
+
+    #tree-type-filter {
+        width: 20;
+    }
+
+    #tree-scope-col {
+        height: auto;
+        width: auto;
+    }
+
+    #tree-scope-input {
+        width: 15;
+    }
+
+    #tree-detail-container {
+        width: 40%;
+        height: 100%;
+        border-left: solid $accent;
+    }
+
+    DiscoveryTree {
+        height: 1fr;
+    }
+
+    TreeDetailView {
+        height: 100%;
+        overflow-y: auto;
+        padding: 1;
+    }
+
+    StatisticsView {
+        padding: 1;
+        overflow-y: auto;
+    }
+
+    PresetView {
+        width: 100%;
+        height: 100%;
+        overflow-y: auto;
+    }
+
+    #scan-table {
+        height: 1fr;
+    }
+
+    #header {
+        padding: 1;
+        background: $panel;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit", priority=True),
+    ]
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path = path
+        self.is_directory = path.is_dir() and (path / "output.json").exists() == False
+        self.config_file = Path.home() / ".bbot_viewer_config.json"
+
+    def load_config(self) -> dict:
+        """Load saved configuration"""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def save_config(self, config: dict) -> None:
+        """Save configuration"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+        except:
+            pass
+
+    def watch_theme(self, theme: str) -> None:
+        """Called when theme changes - save the new theme"""
+        config = self.load_config()
+        config['theme'] = theme
+        self.save_config(config)
+
+    def on_mount(self) -> None:
+        """Set up the application"""
+        # Load and apply saved theme
+        config = self.load_config()
+        if 'theme' in config:
+            self.theme = config['theme']
+
+        if self.is_directory:
+            # Show scan list
+            self.title = "BBOT Viewer - Scan List"
+            self.push_screen(ScanListScreen(self.path))
+        else:
+            # Show single scan directly
+            self.title = f"BBOT Viewer - {self.path.name}"
+            self.push_screen(ScanViewerScreen(self.path))
+
+
+def main():
+    """Main entry point"""
+    # Default to ~/.bbot/scans if no path provided
+    if len(sys.argv) < 2:
+        path = Path("~/.bbot/scans").expanduser()
+        print(f"No path specified, using default: {path}")
+    else:
+        path = Path(sys.argv[1]).expanduser()
+
+    if not path.exists():
+        print(f"Error: Path not found: {path}")
+        sys.exit(1)
+
+    if not path.is_dir():
+        print(f"Error: Path must be a directory: {path}")
+        sys.exit(1)
+
+    # Check if it's a single scan directory or a parent scans directory
+    has_output_json = (path / "output.json").exists()
+
+    if not has_output_json:
+        # Check if it contains scan subdirectories
+        scan_dirs = [d for d in path.iterdir() if d.is_dir() and (d / "output.json").exists()]
+        if not scan_dirs:
+            print(f"Error: No scan directories found in {path}")
+            print("Looking for directories containing output.json files")
+            sys.exit(1)
+
+    app = BBotViewer(path)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -18,20 +18,20 @@ A self-contained terminal UI for browsing and analyzing [BBOT](https://www.black
 
 ```bash
 # Copy to server and run (auto-installs on first run)
-./bbot-viewer
+./bbot-ui
 
 # Or specify custom path
-./bbot-viewer /path/to/scans
+./bbot-ui /path/to/scans
 ```
 
-First run creates `.bbot_viewer_venv/` and installs dependencies. Subsequent runs launch instantly.
+First run creates `.bbot_ui_venv/` and installs dependencies. Subsequent runs launch instantly.
 
 ## Usage
 
 ```bash
-./bbot-viewer                          # Default: ~/.bbot/scans
-./bbot-viewer /path/to/scans          # Browse all scans in directory
-./bbot-viewer ~/.bbot/scans/scan-name # View specific scan
+./bbot-ui                          # Default: ~/.bbot/scans
+./bbot-ui /path/to/scans          # Browse all scans in directory
+./bbot-ui ~/.bbot/scans/scan-name # View specific scan
 ```
 
 ## Interface
@@ -73,7 +73,7 @@ Examples:
 
 **Setup didn't complete properly?**
 ```bash
-rm -rf .bbot_viewer_venv && ./bbot-viewer
+rm -rf .bbot_ui_venv && ./bbot-ui
 ```
 
 **No output.json found?**
@@ -96,7 +96,7 @@ brew install python3
 ## Tips
 
 - Viewer limits display to 1000 events; use filters for large scans
-- Delete `.bbot_viewer_venv/` to force clean reinstall
+- Delete `.bbot_ui_venv/` to force clean reinstall
 - Each directory maintains its own venv when script is copied
 
 ## License

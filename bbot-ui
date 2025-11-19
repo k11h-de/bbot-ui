@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BBOT TUI Viewer - Self-installing terminal-based interface for browsing BBOT scan results
+BBOT TUI - Self-installing terminal-based interface for browsing BBOT scan results
 
 This script automatically sets up its own virtual environment and dependencies on first run.
 Simply copy this file to any server and run it - no other setup required!
@@ -20,7 +20,7 @@ def setup_environment():
     """Set up virtual environment and install dependencies"""
     script_path = Path(__file__).resolve()
     script_dir = script_path.parent
-    venv_dir = script_dir / ".bbot_viewer_venv"
+    venv_dir = script_dir / ".bbot_ui_venv"
     marker_file = venv_dir / ".setup_complete"
 
     # Check if setup is already complete
@@ -35,7 +35,7 @@ def setup_environment():
         os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
 
     print("=" * 60)
-    print("BBOT Viewer - First Run Setup")
+    print("BBOT TUI - First Run Setup")
     print("=" * 60)
 
     # Create virtual environment
@@ -77,7 +77,7 @@ def setup_environment():
     marker_file.touch()
 
     # Re-execute this script using the venv Python
-    print(f"\n[3/3] Launching BBOT Viewer...")
+    print(f"\n[3/3] Launching BBOT TUI...")
     print("=" * 60 + "\n")
 
     os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
@@ -86,7 +86,7 @@ def setup_environment():
 if __name__ == "__main__":
     script_path = Path(__file__).resolve()
     script_dir = script_path.parent
-    venv_dir = script_dir / ".bbot_viewer_venv"
+    venv_dir = script_dir / ".bbot_ui_venv"
     marker_file = venv_dir / ".setup_complete"
 
     # Determine if we're running from the venv Python
@@ -1250,7 +1250,7 @@ class ScanViewerScreen(Screen):
 
 
 class BBotViewer(App):
-    """Main BBOT Viewer application"""
+    """Main BBOT TUI application"""
 
     CSS = """
     #findings-pane {
@@ -1426,7 +1426,7 @@ class BBotViewer(App):
         super().__init__()
         self.path = path
         self.is_directory = path.is_dir() and (path / "output.json").exists() == False
-        self.config_file = Path.home() / ".bbot_viewer_config.json"
+        self.config_file = Path.home() / ".bbot_ui_config.json"
 
     def load_config(self) -> dict:
         """Load saved configuration"""
@@ -1461,11 +1461,11 @@ class BBotViewer(App):
 
         if self.is_directory:
             # Show scan list
-            self.title = "BBOT Viewer - Scan List"
+            self.title = "BBOT TUI - Scan List"
             self.push_screen(ScanListScreen(self.path))
         else:
             # Show single scan directly
-            self.title = f"BBOT Viewer - {self.path.name}"
+            self.title = f"BBOT TUI - {self.path.name}"
             self.push_screen(ScanViewerScreen(self.path))
 
 

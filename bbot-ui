@@ -19,8 +19,7 @@ DEPENDENCIES = [
 def setup_environment():
     """Set up virtual environment and install dependencies"""
     script_path = Path(__file__).resolve()
-    script_dir = script_path.parent
-    venv_dir = script_dir / ".bbot_ui_venv"
+    venv_dir = Path("~/.bbot_ui_venv").expanduser()
     marker_file = venv_dir / ".setup_complete"
 
     # Check if setup is already complete
@@ -85,8 +84,7 @@ def setup_environment():
 # Bootstrap: Check if we need to set up the environment
 if __name__ == "__main__":
     script_path = Path(__file__).resolve()
-    script_dir = script_path.parent
-    venv_dir = script_dir / ".bbot_ui_venv"
+    venv_dir = Path("~/.bbot_ui_venv").expanduser()
     marker_file = venv_dir / ".setup_complete"
 
     # Determine if we're running from the venv Python

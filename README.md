@@ -73,7 +73,7 @@ Examples:
 
 **Setup didn't complete properly?**
 ```bash
-rm -rf .bbot_ui_venv && ./bbot-ui
+rm -rf ~/.bbot_ui_venv && ./bbot-ui
 ```
 
 **No output.json found?**
@@ -96,8 +96,7 @@ brew install python3
 ## Tips
 
 - Viewer limits display to 1000 events; use filters for large scans
-- Delete `.bbot_ui_venv/` to force clean reinstall
-- Each directory maintains its own venv when script is copied
+- Delete `~/.bbot_ui_venv/` to force clean reinstall
 
 ## License
 

@@ -147,6 +147,8 @@ class ScanData:
         self.events: List[Dict[str, Any]] = []
         self.scan_info: Dict[str, Any] = {}
         self.preset_content: str = ""
+        self.file_position: int = 0  # Track position in output.json for incremental reads
+        self.last_modified: float = 0  # Track last modification time
         self.load_events()
         self.load_preset()
 
@@ -170,6 +172,70 @@ class ScanData:
                             self.events.append(event)
                     except json.JSONDecodeError:
                         continue
+
+        # Update file position and modification time
+        try:
+            self.file_position = json_file.stat().st_size
+            self.last_modified = json_file.stat().st_mtime
+        except:
+            pass
+
+    def check_for_updates(self) -> bool:
+        """Check if output.json has been modified and return True if new data exists"""
+        json_file = self.scan_path / "output.json"
+        if not json_file.exists():
+            return False
+
+        try:
+            current_mtime = json_file.stat().st_mtime
+            current_size = json_file.stat().st_size
+
+            # Check if file has been modified and grown
+            if current_mtime > self.last_modified or current_size > self.file_position:
+                return True
+        except:
+            pass
+
+        return False
+
+    def load_new_events(self) -> int:
+        """Load only new events that have been added since last read. Returns number of new events."""
+        json_file = self.scan_path / "output.json"
+        if not json_file.exists():
+            return 0
+
+        new_event_count = 0
+
+        try:
+            with open(json_file, "r") as f:
+                # Seek to last known position
+                f.seek(self.file_position)
+
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            event = json.loads(line)
+                            if event.get("type") == "SCAN":
+                                # Update scan info if it changed
+                                if not self.scan_info:
+                                    self.scan_info = event
+                            else:
+                                self.events.append(event)
+                                new_event_count += 1
+                        except json.JSONDecodeError:
+                            # Skip malformed lines (might be incomplete writes)
+                            continue
+
+            # Update file position and modification time
+            self.file_position = json_file.stat().st_size
+            self.last_modified = json_file.stat().st_mtime
+
+        except Exception as e:
+            # If there's an error reading incrementally, we'll try again next time
+            pass
+
+        return new_event_count
 
     def load_preset(self):
         """Load preset configuration from preset.yml"""
@@ -217,6 +283,10 @@ class StatisticsView(VerticalScroll):
 
     def on_mount(self) -> None:
         """Build statistics display on mount"""
+        self.build_statistics()
+
+    def build_statistics(self) -> None:
+        """Build or rebuild statistics display"""
         stats = self.scan_data.get_statistics()
 
         # Header section
@@ -303,6 +373,13 @@ class StatisticsView(VerticalScroll):
             )
 
         self.mount(Static(scope_table))
+
+    def refresh_statistics(self) -> None:
+        """Clear and rebuild statistics with updated data"""
+        # Remove all existing children
+        self.remove_children()
+        # Rebuild with new data
+        self.build_statistics()
 
 
 class PresetView(Static):
@@ -866,16 +943,22 @@ class ScanListScreen(Screen):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit"),
+        Binding("r", "refresh_scans", "Refresh"),
     ]
 
-    def __init__(self, scans_dir: Path):
+    def __init__(self, scans_dir: Path, refresh_interval: float = 3.0, live_threshold: int = 10):
         super().__init__()
         self.scans_dir = scans_dir
+        self.refresh_interval = refresh_interval
+        self.live_threshold = live_threshold
         self.scans = self.discover_scans()
+        self.refresh_timer = None
+        self.scan_timestamps = {}  # Track last modified time for each scan
 
     def discover_scans(self) -> List[Dict[str, Any]]:
         """Discover all scan directories"""
         scans = []
+        current_time = datetime.now()
 
         for scan_dir in sorted(self.scans_dir.iterdir()):
             if not scan_dir.is_dir() or scan_dir.name.startswith('.'):
@@ -889,6 +972,8 @@ class ScanListScreen(Screen):
             event_count = 0
             finding_count = 0
             modified_time = "Unknown"
+            modified_timestamp = 0
+            is_live = False
 
             try:
                 with open(output_json, 'r') as f:
@@ -903,7 +988,16 @@ class ScanListScreen(Screen):
                             continue
 
                 stat = output_json.stat()
-                modified_time = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                modified_timestamp = stat.st_mtime
+                modified_time = datetime.fromtimestamp(modified_timestamp).strftime("%Y-%m-%d %H:%M")
+
+                # Check if scan was modified recently (likely still running)
+                age_seconds = (current_time - datetime.fromtimestamp(modified_timestamp)).total_seconds()
+                is_live = age_seconds < self.live_threshold
+
+                # Track timestamp for change detection
+                self.scan_timestamps[scan_dir.name] = modified_timestamp
+
             except Exception:
                 pass
 
@@ -913,6 +1007,8 @@ class ScanListScreen(Screen):
                 "event_count": event_count,
                 "finding_count": finding_count,
                 "modified": modified_time,
+                "modified_timestamp": modified_timestamp,
+                "is_live": is_live,
             })
 
         return scans
@@ -935,23 +1031,101 @@ class ScanListScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        """Set up the scan table"""
+        """Set up the scan table and start auto-refresh"""
         table = self.query_one("#scan-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("Scan Name", "Events", "Findings", "Last Modified")
 
+        self.refresh_table()
+
+        # Start auto-refresh timer
+        self.refresh_timer = self.set_interval(self.refresh_interval, self.check_for_scan_updates)
+
+    def on_unmount(self) -> None:
+        """Clean up timer when screen is removed"""
+        if self.refresh_timer:
+            self.refresh_timer.stop()
+
+    def refresh_table(self) -> None:
+        """Refresh the scan table with current data"""
+        table = self.query_one("#scan-table", DataTable)
+        old_cursor = table.cursor_row
+
+        # Clear and rebuild table
+        table.clear()
+
         for scan in self.scans:
+            # Format scan name with live indicator
+            scan_name = scan["name"]
+            if scan.get("is_live", False):
+                scan_name = f"[bold green]● {scan_name}[/bold green]"
+
             # Format findings count with highlighting if > 0
             findings_str = str(scan["finding_count"])
             if scan["finding_count"] > 0:
                 findings_str = f"⚠ {findings_str}"
 
             table.add_row(
-                scan["name"],
+                scan_name,
                 str(scan["event_count"]),
                 findings_str,
                 scan["modified"],
             )
+
+        # Restore cursor position if possible
+        if old_cursor < table.row_count:
+            table.move_cursor(row=old_cursor)
+
+    def check_for_scan_updates(self) -> None:
+        """Check if any scans have been updated or new scans added"""
+        has_changes = False
+
+        # Check for new scans or modified scans
+        for scan_dir in self.scans_dir.iterdir():
+            if not scan_dir.is_dir() or scan_dir.name.startswith('.'):
+                continue
+
+            output_json = scan_dir / "output.json"
+            if not output_json.exists():
+                continue
+
+            scan_name = scan_dir.name
+
+            # Check if this is a new scan
+            if scan_name not in self.scan_timestamps:
+                has_changes = True
+                break
+
+            # Check if scan has been modified
+            try:
+                current_mtime = output_json.stat().st_mtime
+                if current_mtime > self.scan_timestamps.get(scan_name, 0):
+                    has_changes = True
+                    break
+            except:
+                pass
+
+        # If changes detected, refresh the scan list
+        if has_changes:
+            self.scans = self.discover_scans()
+            self.refresh_table()
+
+    def action_refresh_scans(self) -> None:
+        """Manually refresh the scan list"""
+        old_count = len(self.scans)
+        self.scans = self.discover_scans()
+        new_count = len(self.scans)
+        self.refresh_table()
+
+        if new_count > old_count:
+            self.notify(f"Found {new_count - old_count} new scan(s)", timeout=2)
+        elif has_changes := any(
+            s["modified_timestamp"] > self.scan_timestamps.get(s["name"], 0)
+            for s in self.scans
+        ):
+            self.notify("Scan list refreshed", timeout=2)
+        else:
+            self.notify("No changes detected", timeout=2)
 
     def on_key(self, event) -> None:
         """Handle key events for wraparound navigation in scan list"""
@@ -981,21 +1155,29 @@ class ScanViewerScreen(Screen):
         Binding("f", "focus_filter", "Filter"),
         Binding("left", "adjust_split_left", "Split ←"),
         Binding("right", "adjust_split_right", "Split →"),
+        Binding("r", "refresh_scan", "Refresh"),
     ]
 
     split_ratio = reactive(60)  # Default 60% for main panel
+    is_live = reactive(False)  # Track if scan is actively updating
+    total_events = reactive(0)  # Track total event count for live updates
 
-    def __init__(self, scan_path: Path):
+    def __init__(self, scan_path: Path, refresh_interval: float = 2.0):
         super().__init__()
         self.scan_data = ScanData(scan_path)
+        self.refresh_interval = refresh_interval
         self.current_type_filter = "All"
         self.current_scope_filter = None  # None means "all"
         self.tree_type_filter = "All"
         self.tree_scope_filter = None  # None means "all"
+        self.refresh_timer = None
 
     def compose(self) -> ComposeResult:
         """Create the scan viewer UI"""
         yield Header()
+
+        # Add live status indicator
+        yield Static("", id="live-status")
 
         # Get unique event types for filter
         event_types = ["All"] + sorted(
@@ -1087,6 +1269,136 @@ class ScanViewerScreen(Screen):
                     yield Static("No preset configuration available")
 
         yield Footer()
+
+    def on_mount(self) -> None:
+        """Set up periodic refresh check"""
+        self.total_events = len(self.scan_data.events)
+        # Check for updates at configured interval
+        self.refresh_timer = self.set_interval(self.refresh_interval, self.check_for_updates)
+        # Update initial status
+        self.update_live_status()
+
+    def watch_is_live(self, is_live: bool) -> None:
+        """React to live status changes"""
+        self.update_live_status()
+
+    def watch_total_events(self, total_events: int) -> None:
+        """React to event count changes"""
+        self.update_live_status()
+
+    def update_live_status(self) -> None:
+        """Update the live status indicator"""
+        try:
+            status_widget = self.query_one("#live-status", Static)
+            if self.is_live:
+                status_widget.update(
+                    f"[bold green]● LIVE[/bold green] - {self.total_events:,} events (updating...)"
+                )
+            else:
+                status_widget.update(
+                    f"[dim]○ Scan[/dim] - {self.total_events:,} events"
+                )
+        except:
+            pass
+
+    def on_unmount(self) -> None:
+        """Clean up timer when screen is removed"""
+        if self.refresh_timer:
+            self.refresh_timer.stop()
+
+    def check_for_updates(self) -> None:
+        """Periodically check for new data and refresh UI if needed"""
+        if self.scan_data.check_for_updates():
+            new_event_count = self.scan_data.load_new_events()
+            if new_event_count > 0:
+                self.is_live = True
+                self.total_events = len(self.scan_data.events)
+                self.refresh_ui_components()
+        else:
+            # No updates detected, mark as not live
+            self.is_live = False
+
+    def refresh_ui_components(self) -> None:
+        """Refresh all UI components with new data"""
+        try:
+            # Refresh findings table
+            findings_table = self.query_one("#findings-table", FindingsTable)
+            old_cursor = findings_table.cursor_row
+            findings_table.findings = [
+                e for e in self.scan_data.events
+                if e.get("type") in ["VULNERABILITY", "FINDING"]
+            ]
+            findings_table.clear()
+            for finding in findings_table.findings:
+                data = finding.get("data", {})
+                event_type = finding.get("type", "")
+                if event_type == "VULNERABILITY":
+                    severity = data.get("severity", "UNKNOWN")
+                else:
+                    severity = "INFO"
+                host = data.get("host", "")
+                description = data.get("description", "")[:70]
+                url = data.get("url", "")[:40]
+                module = finding.get("module", "")
+                findings_table.add_row(event_type, severity, host, description, url, module)
+            # Restore cursor position if possible
+            if old_cursor < findings_table.row_count:
+                findings_table.move_cursor(row=old_cursor)
+        except:
+            pass
+
+        try:
+            # Refresh event table
+            event_table = self.query_one("#event-table", EventTable)
+            event_table.refresh_table(self.current_type_filter, self.current_scope_filter)
+        except:
+            pass
+
+        try:
+            # Refresh tree view
+            tree = self.query_one("#discovery-tree", DiscoveryTree)
+            tree.rebuild_tree(self.tree_type_filter, self.tree_scope_filter)
+        except:
+            pass
+
+        # Update event type filter options (in case new event types appeared)
+        try:
+            event_types = ["All"] + sorted(
+                list(set(e.get("type", "") for e in self.scan_data.events))
+            )
+            type_filter = self.query_one("#event-type-filter", Select)
+            current_value = type_filter.value
+            type_filter.set_options([(t, t) for t in event_types])
+            if current_value in event_types:
+                type_filter.value = current_value
+
+            tree_type_filter = self.query_one("#tree-type-filter", Select)
+            current_tree_value = tree_type_filter.value
+            tree_type_filter.set_options([(t, t) for t in event_types])
+            if current_tree_value in event_types:
+                tree_type_filter.value = current_tree_value
+        except:
+            pass
+
+        try:
+            # Refresh statistics view
+            # Note: We need to find the StatisticsView widget in the stats-tab
+            # The StatisticsView is a direct child of the TabPane, so we need to query for it
+            stats_view = self.query_one(StatisticsView)
+            stats_view.refresh_statistics()
+        except:
+            pass
+
+    def action_refresh_scan(self) -> None:
+        """Manually trigger a scan refresh"""
+        new_event_count = self.scan_data.load_new_events()
+        if new_event_count > 0:
+            self.is_live = True
+            self.total_events = len(self.scan_data.events)
+            self.refresh_ui_components()
+            self.notify(f"Loaded {new_event_count} new events", timeout=2)
+        else:
+            self.notify("No new events", timeout=2)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         """Handle row highlight (navigation) in tables"""
@@ -1251,6 +1563,13 @@ class BBotViewer(App):
     """Main BBOT TUI application"""
 
     CSS = """
+    #live-status {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+        text-align: center;
+    }
+
     #findings-pane {
         layout: horizontal;
     }
@@ -1420,11 +1739,28 @@ class BBotViewer(App):
         Binding("q", "quit", "Quit", priority=True),
     ]
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, scan_refresh_interval: float = None, list_refresh_interval: float = None, live_threshold: int = None):
         super().__init__()
         self.path = path
         self.is_directory = path.is_dir() and (path / "output.json").exists() == False
         self.config_file = Path.home() / ".bbot_ui_config.json"
+
+        # Load config and apply defaults
+        config = self.load_config()
+
+        # Refresh intervals (in seconds)
+        self.scan_refresh_interval = scan_refresh_interval if scan_refresh_interval is not None else config.get('scan_refresh_interval', 2.0)
+        self.list_refresh_interval = list_refresh_interval if list_refresh_interval is not None else config.get('list_refresh_interval', 3.0)
+
+        # Live threshold (in seconds) - how recently a scan must be modified to be considered "live"
+        self.live_threshold = live_threshold if live_threshold is not None else config.get('live_threshold', 10)
+
+        # Save to config if changed from defaults
+        if scan_refresh_interval is not None or list_refresh_interval is not None or live_threshold is not None:
+            config['scan_refresh_interval'] = self.scan_refresh_interval
+            config['list_refresh_interval'] = self.list_refresh_interval
+            config['live_threshold'] = self.live_threshold
+            self.save_config(config)
 
     def load_config(self) -> dict:
         """Load saved configuration"""
@@ -1460,21 +1796,68 @@ class BBotViewer(App):
         if self.is_directory:
             # Show scan list
             self.title = "BBOT TUI - Scan List"
-            self.push_screen(ScanListScreen(self.path))
+            self.push_screen(ScanListScreen(self.path, self.list_refresh_interval, self.live_threshold))
         else:
             # Show single scan directly
             self.title = f"BBOT TUI - {self.path.name}"
-            self.push_screen(ScanViewerScreen(self.path))
+            self.push_screen(ScanViewerScreen(self.path, self.scan_refresh_interval))
 
 
 def main():
     """Main entry point"""
-    # Default to ~/.bbot/scans if no path provided
-    if len(sys.argv) < 2:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="BBOT TUI - Terminal interface for browsing BBOT scan results with live refresh",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                                    # Use default path (~/.bbot/scans)
+  %(prog)s /path/to/scans                     # Browse all scans in directory
+  %(prog)s ~/.bbot/scans/example.com          # View specific scan
+  %(prog)s --scan-interval 5 --list-interval 10  # Slower refresh rates
+  %(prog)s --live-threshold 30                # Mark scans as live for 30 seconds
+
+Configuration is saved to ~/.bbot_ui_config.json
+        """
+    )
+
+    parser.add_argument(
+        'path',
+        nargs='?',
+        default=None,
+        help='Path to scan directory or parent scans directory (default: ~/.bbot/scans)'
+    )
+
+    parser.add_argument(
+        '--scan-interval',
+        type=float,
+        metavar='SECONDS',
+        help='Refresh interval for scan detail view in seconds (default: 2.0)'
+    )
+
+    parser.add_argument(
+        '--list-interval',
+        type=float,
+        metavar='SECONDS',
+        help='Refresh interval for scan list view in seconds (default: 3.0)'
+    )
+
+    parser.add_argument(
+        '--live-threshold',
+        type=int,
+        metavar='SECONDS',
+        help='Age threshold in seconds to mark scans as "LIVE" (default: 10)'
+    )
+
+    args = parser.parse_args()
+
+    # Determine path
+    if args.path:
+        path = Path(args.path).expanduser()
+    else:
         path = Path("~/.bbot/scans").expanduser()
         print(f"No path specified, using default: {path}")
-    else:
-        path = Path(sys.argv[1]).expanduser()
 
     if not path.exists():
         print(f"Error: Path not found: {path}")
@@ -1495,7 +1878,12 @@ def main():
             print("Looking for directories containing output.json files")
             sys.exit(1)
 
-    app = BBotViewer(path)
+    app = BBotViewer(
+        path,
+        scan_refresh_interval=args.scan_interval,
+        list_refresh_interval=args.list_interval,
+        live_threshold=args.live_threshold
+    )
     app.run()
 
 

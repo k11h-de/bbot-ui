@@ -14,6 +14,7 @@ from pathlib import Path
 DEPENDENCIES = [
     "textual>=0.47.0",
     "rich>=13.0.0",
+    "psutil>=5.9.0",  # For detecting active scan processes (cross-platform)
 ]
 
 def setup_environment():
@@ -148,7 +149,8 @@ class ScanData:
         self.scan_info: Dict[str, Any] = {}
         self.preset_content: str = ""
         self.file_position: int = 0  # Track position in output.json for incremental reads
-        self.last_modified: float = 0  # Track last modification time
+        self.file_handler_cache = None  # Cache for file handler check: (result, timestamp)
+        self.cache_ttl = 5.0  # Cache results for 5 seconds
         self.load_events()
         self.load_preset()
 
@@ -165,33 +167,111 @@ class ScanData:
                     try:
                         event = json.loads(line)
                         if event.get("type") == "SCAN":
-                            # Keep the first SCAN event (don't overwrite if already set)
-                            if not self.scan_info:
-                                self.scan_info = event
+                            # Keep the LAST SCAN event (overwrite previous ones)
+                            self.scan_info = event
                         else:
                             self.events.append(event)
                     except json.JSONDecodeError:
                         continue
 
-        # Update file position and modification time
+        # Update file position
         try:
             self.file_position = json_file.stat().st_size
-            self.last_modified = json_file.stat().st_mtime
         except:
             pass
 
+    def _check_file_open_psutil(self, file_path: Path) -> bool:
+        """
+        Check if file is open using psutil (native Python, cross-platform).
+        Returns True if open, False if not, None if psutil unavailable.
+        """
+        try:
+            import psutil
+            file_path_str = str(file_path.resolve())
+
+            # Iterate through all processes
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    # Check if process has the file open
+                    for open_file in proc.open_files():
+                        if open_file.path == file_path_str:
+                            return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    # Process ended or we don't have permission
+                    continue
+
+            return False
+        except ImportError:
+            # psutil not available
+            return None
+        except Exception:
+            # Other error
+            return None
+
+
+    def _has_active_file_handler(self, file_path: Path) -> bool:
+        """
+        Check if any process has an active file handler on the given file.
+        Uses caching to avoid expensive checks on every refresh.
+        Returns True if file is open, False if not.
+        """
+        import time
+
+        # Check cache first
+        if self.file_handler_cache is not None:
+            cached_result, cached_time = self.file_handler_cache
+            if time.time() - cached_time < self.cache_ttl:
+                return cached_result
+
+        # Use psutil (auto-installed dependency, cross-platform)
+        result = self._check_file_open_psutil(file_path)
+        if result is not None:
+            self.file_handler_cache = (result, time.time())
+            return result
+
+        # psutil failed (should never happen) - assume file is open to be safe
+        return True
+
+    def get_scan_status(self) -> str:
+        """
+        Get the current scan status.
+        Returns: "RUNNING", "FINISHED", "INTERRUPTED", or "UNKNOWN"
+        """
+        status = self.scan_info.get("data", {}).get("status", "UNKNOWN")
+
+        # Only check for active processes if status is RUNNING
+        # Skip expensive checks for FINISHED scans
+        if status == "RUNNING":
+            json_file = self.scan_path / "output.json"
+            if json_file.exists():
+                # Check if process has file open (uses psutil with caching)
+                if not self._has_active_file_handler(json_file):
+                    # No process has the file open -> scan is interrupted
+                    return "INTERRUPTED"
+
+        return status
+
+    def is_scan_running(self) -> bool:
+        """Check if the scan is currently running (not interrupted or finished)"""
+        return self.get_scan_status() == "RUNNING"
+
     def check_for_updates(self) -> bool:
-        """Check if output.json has been modified and return True if new data exists"""
+        """Check if output.json has new data and scan is still running"""
+        status = self.get_scan_status()
+
+        # Don't check for updates if scan is finished or interrupted
+        if status in ["FINISHED", "INTERRUPTED"]:
+            return False
+
         json_file = self.scan_path / "output.json"
         if not json_file.exists():
             return False
 
         try:
-            current_mtime = json_file.stat().st_mtime
             current_size = json_file.stat().st_size
 
-            # Check if file has been modified and grown
-            if current_mtime > self.last_modified or current_size > self.file_position:
+            # Check if file has grown
+            if current_size > self.file_position:
                 return True
         except:
             pass
@@ -217,9 +297,8 @@ class ScanData:
                         try:
                             event = json.loads(line)
                             if event.get("type") == "SCAN":
-                                # Update scan info if it changed
-                                if not self.scan_info:
-                                    self.scan_info = event
+                                # Always update scan info to keep the LAST SCAN event
+                                self.scan_info = event
                             else:
                                 self.events.append(event)
                                 new_event_count += 1
@@ -227,9 +306,8 @@ class ScanData:
                             # Skip malformed lines (might be incomplete writes)
                             continue
 
-            # Update file position and modification time
+            # Update file position
             self.file_position = json_file.stat().st_size
-            self.last_modified = json_file.stat().st_mtime
 
         except Exception as e:
             # If there's an error reading incrementally, we'll try again next time
@@ -404,39 +482,110 @@ class PresetView(Static):
             self.update("No preset configuration available")
 
 
-class FindingsTable(DataTable):
-    """DataTable for displaying vulnerability and finding events"""
+class VulnerabilitiesTable(DataTable):
+    """DataTable for displaying VULNERABILITY events sorted by severity"""
+
+    # Severity order for sorting (higher value = higher severity)
+    SEVERITY_ORDER = {
+        "CRITICAL": 5,
+        "HIGH": 4,
+        "MEDIUM": 3,
+        "LOW": 2,
+        "INFO": 1,
+        "UNKNOWN": 0,
+    }
+
+    # Limit display to prevent UI performance issues
+    MAX_DISPLAY_ROWS = 1000
 
     def __init__(self, scan_data: ScanData, **kwargs):
         super().__init__(**kwargs)
         self.scan_data = scan_data
-        # Include both VULNERABILITY and FINDING types
+        # Only include VULNERABILITY events
+        self.vulnerabilities = [
+            e for e in scan_data.events
+            if e.get("type") == "VULNERABILITY"
+        ]
+        self.cursor_type = "row"
+
+    def _get_severity(self, vuln: Dict[str, Any]) -> str:
+        """Get the severity level of a vulnerability"""
+        return vuln.get("data", {}).get("severity", "UNKNOWN")
+
+    def _sort_vulnerabilities_by_severity(self) -> None:
+        """Sort vulnerabilities by severity (highest first)"""
+        self.vulnerabilities.sort(
+            key=lambda v: self.SEVERITY_ORDER.get(self._get_severity(v).upper(), 0),
+            reverse=True
+        )
+
+    def on_mount(self) -> None:
+        """Set up the vulnerabilities table"""
+        self.add_columns("Severity", "Host", "Description", "URL", "Module")
+
+        # Sort vulnerabilities by severity before displaying
+        self._sort_vulnerabilities_by_severity()
+
+        # Limit to MAX_DISPLAY_ROWS for performance
+        display_vulns = self.vulnerabilities[:self.MAX_DISPLAY_ROWS]
+
+        for vuln in display_vulns:
+            from rich.text import Text
+            data = vuln.get("data", {})
+            severity = data.get("severity", "UNKNOWN")
+            host = data.get("host", "")
+            # Use Text.from_markup() with escape to prevent bracket interpretation
+            description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
+            url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
+            module = vuln.get("module", "")
+
+            self.add_row(severity, host, description, url, module)
+
+    def on_key(self, event) -> None:
+        """Handle key events for wraparound navigation"""
+        if event.key == "down" or event.key == "j":
+            if self.cursor_row == self.row_count - 1:
+                self.move_cursor(row=0)
+                event.stop()
+        elif event.key == "up" or event.key == "k":
+            if self.cursor_row == 0:
+                self.move_cursor(row=self.row_count - 1)
+                event.stop()
+
+
+class FindingsTable(DataTable):
+    """DataTable for displaying FINDING events (no severity filtering)"""
+
+    # Limit display to prevent UI performance issues
+    MAX_DISPLAY_ROWS = 1000
+
+    def __init__(self, scan_data: ScanData, **kwargs):
+        super().__init__(**kwargs)
+        self.scan_data = scan_data
+        # Only include FINDING events
         self.findings = [
             e for e in scan_data.events
-            if e.get("type") in ["VULNERABILITY", "FINDING"]
+            if e.get("type") == "FINDING"
         ]
         self.cursor_type = "row"
 
     def on_mount(self) -> None:
         """Set up the findings table"""
-        self.add_columns("Type", "Severity", "Host", "Description", "URL", "Module")
+        self.add_columns("Host", "Description", "URL", "Module")
 
-        for finding in self.findings:
+        # Limit to MAX_DISPLAY_ROWS for performance
+        display_findings = self.findings[:self.MAX_DISPLAY_ROWS]
+
+        for finding in display_findings:
+            from rich.text import Text
             data = finding.get("data", {})
-            event_type = finding.get("type", "")
-
-            # VULNERABILITY has severity, FINDING doesn't
-            if event_type == "VULNERABILITY":
-                severity = data.get("severity", "UNKNOWN")
-            else:  # FINDING
-                severity = "INFO"
-
             host = data.get("host", "")
-            description = data.get("description", "")[:70]  # Truncate
-            url = data.get("url", "")[:40]  # Truncate
+            # Use Text() to treat content as plain text (no markup interpretation)
+            description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
+            url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
             module = finding.get("module", "")
 
-            self.add_row(event_type, severity, host, description, url, module)
+            self.add_row(host, description, url, module)
 
     def on_key(self, event) -> None:
         """Handle key events for wraparound navigation"""
@@ -625,6 +774,10 @@ class EventDetailView(VerticalScroll):
 class DiscoveryTree(Tree):
     """Tree widget showing event discovery hierarchy"""
 
+    # Limit tree nodes to prevent UI performance issues
+    # Trees are more expensive to render than tables
+    MAX_TREE_NODES = 500
+
     def __init__(self, scan_data: ScanData, **kwargs):
         super().__init__("Discovery", **kwargs)
         self.scan_data = scan_data
@@ -687,8 +840,11 @@ class DiscoveryTree(Tree):
         # Get SCAN uuid from scan_info
         scan_uuid = self.scan_data.scan_info.get("uuid")
 
+        # Limit events processed for performance
+        events_to_process = self.scan_data.events[:self.MAX_TREE_NODES]
+
         # Index all events by parent (only include events that pass filter)
-        for event in self.scan_data.events:
+        for event in events_to_process:
             if not self._filter_event(event):
                 continue
 
@@ -718,7 +874,10 @@ class DiscoveryTree(Tree):
         technologies = {}     # keyed by host
         others = []
 
-        for event in self.scan_data.events:
+        # Limit events processed for performance
+        events_to_process = self.scan_data.events[:self.MAX_TREE_NODES]
+
+        for event in events_to_process:
             # Skip events that don't pass filter
             if not self._filter_event(event):
                 continue
@@ -946,19 +1105,248 @@ class ScanListScreen(Screen):
         Binding("r", "refresh_scans", "Refresh"),
     ]
 
-    def __init__(self, scans_dir: Path, refresh_interval: float = 3.0, live_threshold: int = 10):
+    def __init__(self, scans_dir: Path, refresh_interval: float = 3.0):
         super().__init__()
         self.scans_dir = scans_dir
         self.refresh_interval = refresh_interval
-        self.live_threshold = live_threshold
-        self.scans = self.discover_scans()
+        self.scans = self.discover_scans(initial_load=True)  # Defer RUNNING status checks on first load
         self.refresh_timer = None
-        self.scan_timestamps = {}  # Track last modified time for each scan
+        self.scan_statuses = {}  # Track scan status for each scan
+        self.scan_event_counts = {}  # Cache event/vuln/finding counts for FINISHED/INTERRUPTED scans: {scan_name: (events, vulns, findings)}
+        self.file_handler_cache = {}  # Cache file handler check results: {path: (result, timestamp)}
+        self.cache_ttl = 5.0  # Cache results for 5 seconds
 
-    def discover_scans(self) -> List[Dict[str, Any]]:
-        """Discover all scan directories"""
+    def _check_file_open_psutil(self, file_path: Path) -> bool:
+        """
+        Check if file is open using psutil (native Python, cross-platform).
+        Returns True if open, False if not, None if psutil unavailable.
+        """
+        try:
+            import psutil
+            file_path_str = str(file_path.resolve())
+
+            # Iterate through all processes
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    # Check if process has the file open
+                    for open_file in proc.open_files():
+                        if open_file.path == file_path_str:
+                            return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    # Process ended or we don't have permission
+                    continue
+
+            return False
+        except ImportError:
+            # psutil not available
+            return None
+        except Exception:
+            # Other error
+            return None
+
+
+    def _check_active_file_handler(self, file_path: Path) -> bool:
+        """
+        Check if any process has an active file handler on the given file.
+        Uses caching to avoid expensive checks on every refresh.
+        Returns True if file is open, False if not.
+        """
+        import time
+
+        # Check cache first
+        cache_key = str(file_path)
+        if cache_key in self.file_handler_cache:
+            cached_result, cached_time = self.file_handler_cache[cache_key]
+            if time.time() - cached_time < self.cache_ttl:
+                return cached_result
+
+        # Use psutil (auto-installed dependency, cross-platform)
+        result = self._check_file_open_psutil(file_path)
+        if result is not None:
+            self.file_handler_cache[cache_key] = (result, time.time())
+            return result
+
+        # psutil failed (should never happen) - assume file is open to be safe
+        return True
+
+    def _get_last_scan_event(self, file_path: Path, thorough: bool = False) -> dict:
+        """
+        Get the MOST RECENT SCAN event from output.json.
+
+        Note: The same scan directory can be reused multiple times, so the file may contain
+        multiple SCAN events with different IDs. We need to find the chronologically last one.
+
+        Args:
+            thorough: If True, read entire file to find all SCAN events (100% reliable).
+                     If False, use optimized approach (read first 200KB and last 50KB).
+                     Use thorough=True for FINISHED/INTERRUPTED scans (checked only once).
+                     Use thorough=False for RUNNING scans (checked repeatedly).
+        """
+        scan_events = []
+
+        try:
+            if thorough:
+                # Read entire file to find ALL SCAN events (100% reliable)
+                # This is acceptable for FINISHED/INTERRUPTED scans since we only do it once
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                            if event.get("type") == "SCAN":
+                                scan_events.append(event)
+                        except:
+                            continue
+            else:
+                # Optimized approach: read from both ends (for RUNNING scans checked repeatedly)
+                with open(file_path, 'rb') as f:
+                    f.seek(0, 2)
+                    file_size = f.tell()
+
+                    # Read from END (most recent events, including FINISHED scans)
+                    read_size = min(50000, file_size)
+                    f.seek(max(0, file_size - read_size))
+                    tail = f.read().decode('utf-8', errors='ignore')
+
+                    for line in tail.split('\n'):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                            if event.get("type") == "SCAN":
+                                scan_events.append(event)
+                        except:
+                            continue
+
+                    # Read from BEGINNING (for old scan runs and RUNNING scans)
+                    f.seek(0)
+                    head = f.read(min(200000, file_size))
+                    head_text = head.decode('utf-8', errors='ignore')
+
+                    for line in head_text.split('\n'):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                            if event.get("type") == "SCAN":
+                                # Check if we already have this one (avoid duplicates)
+                                event_id = event.get("id")
+                                if not any(e.get("id") == event_id and e.get("data", {}).get("status") == event.get("data", {}).get("status") for e in scan_events):
+                                    scan_events.append(event)
+                        except:
+                            continue
+
+            # Return the SCAN event with the most recent timestamp
+            if scan_events:
+                # Sort by timestamp (most recent last)
+                scan_events.sort(key=lambda e: e.get("timestamp", ""), reverse=False)
+                return scan_events[-1]  # Return most recent
+
+        except:
+            pass
+
+        return None
+
+    def _estimate_event_counts(self, file_path: Path, thorough: bool = False) -> tuple:
+        """
+        Get event, vulnerability, and finding counts from output.json.
+
+        Args:
+            thorough: If True, count exactly by reading entire file (100% accurate).
+                     If False, use estimation for large files (fast but approximate).
+                     Use thorough=True for initial load (only once).
+                     Use thorough=False for periodic refresh (repeatedly).
+
+        Returns:
+            Tuple of (event_count, vuln_count, finding_count)
+        """
+        try:
+            stat = file_path.stat()
+            file_size = stat.st_size
+
+            # If thorough mode or small file, count exactly
+            if thorough or file_size < 1_000_000:
+                event_count = 0
+                vuln_count = 0
+                finding_count = 0
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        try:
+                            event = json.loads(line.strip())
+                            event_type = event.get("type", "")
+                            if event_type != "SCAN":
+                                event_count += 1
+                            if event_type == "FINDING":
+                                finding_count += 1
+                            elif event_type == "VULNERABILITY":
+                                vuln_count += 1
+                        except:
+                            continue
+                return (event_count, vuln_count, finding_count)
+
+            # For large files in non-thorough mode, estimate based on line count
+            # Average BBOT event line is ~200-300 bytes
+            estimated_lines = file_size // 250
+
+            # Sample last 100 lines to estimate vulnerability/finding ratio
+            # (Findings typically appear later in scans, so sample from end)
+            vuln_count = 0
+            finding_count = 0
+            sample_size = 0
+            with open(file_path, 'rb') as f:
+                # Read last 50KB
+                f.seek(0, 2)
+                file_size = f.tell()
+                read_size = min(50000, file_size)
+                f.seek(max(0, file_size - read_size))
+                tail = f.read().decode('utf-8', errors='ignore')
+
+                lines = tail.split('\n')
+                # Sample last 100 complete lines
+                for line in lines[-100:]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                        event_type = event.get("type", "")
+                        if event_type != "SCAN":
+                            sample_size += 1
+                        if event_type == "FINDING":
+                            finding_count += 1
+                        elif event_type == "VULNERABILITY":
+                            vuln_count += 1
+                    except:
+                        continue
+
+            # Extrapolate vulnerability and finding counts
+            if sample_size > 0:
+                vuln_ratio = vuln_count / sample_size
+                finding_ratio = finding_count / sample_size
+                estimated_vulns = int(estimated_lines * vuln_ratio)
+                estimated_findings = int(estimated_lines * finding_ratio)
+            else:
+                estimated_vulns = 0
+                estimated_findings = 0
+
+            return (estimated_lines, estimated_vulns, estimated_findings)
+
+        except:
+            return (0, 0, 0)
+
+    def discover_scans(self, initial_load: bool = False) -> List[Dict[str, Any]]:
+        """
+        Discover all scan directories (optimized for large scans)
+
+        Args:
+            initial_load: If True, defer RUNNING status checks (show as UNKNOWN)
+                         If False, perform full status checks (for refreshes)
+        """
         scans = []
-        current_time = datetime.now()
 
         for scan_dir in sorted(self.scans_dir.iterdir()):
             if not scan_dir.is_dir() or scan_dir.name.startswith('.'):
@@ -969,34 +1357,68 @@ class ScanListScreen(Screen):
                 continue
 
             # Get scan metadata
-            event_count = 0
-            finding_count = 0
             modified_time = "Unknown"
-            modified_timestamp = 0
-            is_live = False
+            scan_status = "UNKNOWN"
+            is_running = False
 
             try:
-                with open(output_json, 'r') as f:
-                    for line in f:
-                        try:
-                            event = json.loads(line.strip())
-                            if event.get("type") != "SCAN":
-                                event_count += 1
-                            if event.get("type") in ["VULNERABILITY", "FINDING"]:
-                                finding_count += 1
-                        except:
-                            continue
+                # Get SCAN event
+                # On initial load: use thorough mode (read entire file) for 100% reliability
+                # On refresh: use optimized mode (read from both ends) for speed
+                scan_event = self._get_last_scan_event(output_json, thorough=initial_load)
 
+                # Extract scan status from the last SCAN event
+                if scan_event:
+                    scan_status = scan_event.get("data", {}).get("status", "UNKNOWN")
+
+                # Get event counts
+                # Strategy: Cache ALL counts on initial load (thorough counting)
+                # On refresh: use cached values for all scans, only recalculate for RUNNING scans
+                scan_name = scan_dir.name
+
+                if initial_load:
+                    # Initial load: always count thoroughly and cache
+                    event_count, vuln_count, finding_count = self._estimate_event_counts(output_json, thorough=True)
+                    self.scan_event_counts[scan_name] = (event_count, vuln_count, finding_count)
+                else:
+                    # Refresh: use cached counts for non-RUNNING scans, recalculate for RUNNING
+                    current_tracked_status = self.scan_statuses.get(scan_name, "UNKNOWN")
+                    if current_tracked_status == "RUNNING":
+                        # Recalculate for RUNNING scans with exact counting (thorough mode)
+                        # Only 1-2 RUNNING scans max, so CPU impact is minimal
+                        event_count, vuln_count, finding_count = self._estimate_event_counts(output_json, thorough=True)
+                    elif scan_name in self.scan_event_counts:
+                        # Use cached counts for FINISHED/INTERRUPTED/UNKNOWN scans
+                        event_count, vuln_count, finding_count = self.scan_event_counts[scan_name]
+                    else:
+                        # Fallback: count thoroughly if no cache available
+                        event_count, vuln_count, finding_count = self._estimate_event_counts(output_json, thorough=True)
+                        self.scan_event_counts[scan_name] = (event_count, vuln_count, finding_count)
+
+                # Only check for active processes if status is RUNNING
+                # Skip expensive checks for FINISHED scans
+                if scan_event:
+                    if scan_status == "RUNNING":
+                        if initial_load:
+                            # On initial load: defer status check to avoid blocking startup
+                            # Show as UNKNOWN, will be updated in 0.5s by timer
+                            scan_status = "UNKNOWN"
+                            is_running = False
+                        else:
+                            # On refresh: perform full status check using psutil
+                            if not self._check_active_file_handler(output_json):
+                                scan_status = "INTERRUPTED"
+                            is_running = scan_status == "RUNNING"
+                    else:
+                        # FINISHED scans
+                        is_running = False
+
+                # Get last modified time for display
                 stat = output_json.stat()
-                modified_timestamp = stat.st_mtime
-                modified_time = datetime.fromtimestamp(modified_timestamp).strftime("%Y-%m-%d %H:%M")
+                modified_time = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
 
-                # Check if scan was modified recently (likely still running)
-                age_seconds = (current_time - datetime.fromtimestamp(modified_timestamp)).total_seconds()
-                is_live = age_seconds < self.live_threshold
-
-                # Track timestamp for change detection
-                self.scan_timestamps[scan_dir.name] = modified_timestamp
+                # Track status for change detection
+                self.scan_statuses[scan_dir.name] = scan_status
 
             except Exception:
                 pass
@@ -1005,10 +1427,11 @@ class ScanListScreen(Screen):
                 "name": scan_dir.name,
                 "path": scan_dir,
                 "event_count": event_count,
+                "vuln_count": vuln_count,
                 "finding_count": finding_count,
                 "modified": modified_time,
-                "modified_timestamp": modified_timestamp,
-                "is_live": is_live,
+                "status": scan_status,
+                "is_running": is_running,
             })
 
         return scans
@@ -1017,13 +1440,17 @@ class ScanListScreen(Screen):
         """Create the scan list UI"""
         yield Header()
 
-        # Calculate total findings
+        # Calculate totals
+        total_vulns = sum(scan["vuln_count"] for scan in self.scans)
         total_findings = sum(scan["finding_count"] for scan in self.scans)
-        findings_text = f" ({total_findings} findings)" if total_findings > 0 else ""
+
+        issues_text = ""
+        if total_vulns > 0 or total_findings > 0:
+            issues_text = f" ({total_vulns} vulns, {total_findings} findings)"
 
         with Vertical():
             yield Static(
-                f"# Select a Scan\n\nFound {len(self.scans)} scans{findings_text} in {self.scans_dir}\n",
+                f"# Select a Scan\n\nFound {len(self.scans)} scans{issues_text} in {self.scans_dir}\n",
                 id="header"
             )
             yield DataTable(id="scan-table")
@@ -1034,12 +1461,16 @@ class ScanListScreen(Screen):
         """Set up the scan table and start auto-refresh"""
         table = self.query_one("#scan-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("Scan Name", "Events", "Findings", "Last Modified")
+        table.add_columns("Scan Name", "Status", "Events", "Vulns", "Findings", "Last Modified")
 
         self.refresh_table()
 
         # Start auto-refresh timer
         self.refresh_timer = self.set_interval(self.refresh_interval, self.check_for_scan_updates)
+
+        # Trigger immediate status check for UNKNOWN scans (those with RUNNING status at startup)
+        # This updates them quickly without blocking startup
+        self.set_timer(0.5, self.check_for_scan_updates)
 
     def on_unmount(self) -> None:
         """Clean up timer when screen is removed"""
@@ -1055,19 +1486,36 @@ class ScanListScreen(Screen):
         table.clear()
 
         for scan in self.scans:
-            # Format scan name with live indicator
             scan_name = scan["name"]
-            if scan.get("is_live", False):
-                scan_name = f"[bold green]● {scan_name}[/bold green]"
+
+            # Format status with colors and indicators
+            status = scan.get("status", "UNKNOWN")
+            if status == "RUNNING":
+                status_str = "[bold green]● RUNNING[/bold green]"
+            elif status == "FINISHED":
+                status_str = "[bold blue]✓ FINISHED[/bold blue]"
+            elif status == "INTERRUPTED":
+                status_str = "[bold yellow]⚠ INTERRUPTED[/bold yellow]"
+            elif status == "UNKNOWN":
+                status_str = "[dim italic]○ CHECKING...[/dim italic]"
+            else:
+                status_str = f"[dim]{status}[/dim]"
+
+            # Format vulnerability count with highlighting if > 0
+            vulns_str = str(scan["vuln_count"])
+            if scan["vuln_count"] > 0:
+                vulns_str = f"[red]⚠ {vulns_str}[/red]"
 
             # Format findings count with highlighting if > 0
             findings_str = str(scan["finding_count"])
             if scan["finding_count"] > 0:
-                findings_str = f"⚠ {findings_str}"
+                findings_str = f"[yellow]⚠ {findings_str}[/yellow]"
 
             table.add_row(
                 scan_name,
+                status_str,
                 str(scan["event_count"]),
+                vulns_str,
                 findings_str,
                 scan["modified"],
             )
@@ -1077,10 +1525,12 @@ class ScanListScreen(Screen):
             table.move_cursor(row=old_cursor)
 
     def check_for_scan_updates(self) -> None:
-        """Check if any scans have been updated or new scans added"""
+        """Check if any scans have status changes, new scans added, or RUNNING scans with new events"""
         has_changes = False
+        has_running_scans = False
 
-        # Check for new scans or modified scans
+        # Check for new scans or status changes
+        # Only check RUNNING scans for status changes (optimization)
         for scan_dir in self.scans_dir.iterdir():
             if not scan_dir.is_dir() or scan_dir.name.startswith('.'):
                 continue
@@ -1092,35 +1542,59 @@ class ScanListScreen(Screen):
             scan_name = scan_dir.name
 
             # Check if this is a new scan
-            if scan_name not in self.scan_timestamps:
+            if scan_name not in self.scan_statuses:
                 has_changes = True
                 break
 
-            # Check if scan has been modified
+            # Skip checking scans that are already FINISHED or INTERRUPTED
+            # They won't change status (optimization)
+            current_tracked_status = self.scan_statuses.get(scan_name, "UNKNOWN")
+            if current_tracked_status in ["FINISHED", "INTERRUPTED"]:
+                continue
+
+            # Track if we have any RUNNING scans (they need periodic refresh for event counts)
+            if current_tracked_status == "RUNNING":
+                has_running_scans = True
+
+            # Only check RUNNING scans for status changes
             try:
-                current_mtime = output_json.stat().st_mtime
-                if current_mtime > self.scan_timestamps.get(scan_name, 0):
-                    has_changes = True
-                    break
+                # Use optimized mode (read from both ends) since this is called repeatedly
+                scan_event = self._get_last_scan_event(output_json, thorough=False)
+
+                if scan_event:
+                    current_status = scan_event.get("data", {}).get("status", "UNKNOWN")
+
+                    # Only check for active processes if status is RUNNING
+                    # Skip expensive checks for FINISHED scans
+                    if current_status == "RUNNING":
+                        # Check if process has file open using psutil
+                        if not self._check_active_file_handler(output_json):
+                            current_status = "INTERRUPTED"
+
+                    if current_status != self.scan_statuses.get(scan_name, ""):
+                        has_changes = True
+                        break
             except:
                 pass
 
-        # If changes detected, refresh the scan list
-        if has_changes:
-            self.scans = self.discover_scans()
+        # If changes detected or RUNNING scans exist, refresh the scan list
+        # RUNNING scans need periodic refresh to update event/finding counts
+        if has_changes or has_running_scans:
+            self.scans = self.discover_scans(initial_load=False)
             self.refresh_table()
 
     def action_refresh_scans(self) -> None:
         """Manually refresh the scan list"""
         old_count = len(self.scans)
-        self.scans = self.discover_scans()
+        old_statuses = self.scan_statuses.copy()
+        self.scans = self.discover_scans(initial_load=False)
         new_count = len(self.scans)
         self.refresh_table()
 
         if new_count > old_count:
             self.notify(f"Found {new_count - old_count} new scan(s)", timeout=2)
         elif has_changes := any(
-            s["modified_timestamp"] > self.scan_timestamps.get(s["name"], 0)
+            s["status"] != old_statuses.get(s["name"], "")
             for s in self.scans
         ):
             self.notify("Scan list refreshed", timeout=2)
@@ -1159,8 +1633,8 @@ class ScanViewerScreen(Screen):
     ]
 
     split_ratio = reactive(60)  # Default 60% for main panel
-    is_live = reactive(False)  # Track if scan is actively updating
-    total_events = reactive(0)  # Track total event count for live updates
+    scan_status = reactive("UNKNOWN")  # Track current scan status
+    total_events = reactive(0)  # Track total event count for updates
 
     def __init__(self, scan_path: Path, refresh_interval: float = 2.0):
         super().__init__()
@@ -1184,14 +1658,27 @@ class ScanViewerScreen(Screen):
             list(set(e.get("type", "") for e in self.scan_data.events))
         )
 
-        # Count vulnerabilities and findings for the tab label
+        # Count vulnerabilities and findings for the tab labels
+        vuln_count = len([
+            e for e in self.scan_data.events
+            if e.get("type") == "VULNERABILITY"
+        ])
         finding_count = len([
             e for e in self.scan_data.events
-            if e.get("type") in ["VULNERABILITY", "FINDING"]
+            if e.get("type") == "FINDING"
         ])
+        vulns_label = f"Vulnerabilities ({vuln_count})" if vuln_count > 0 else "Vulnerabilities"
         findings_label = f"Findings ({finding_count})" if finding_count > 0 else "Findings"
 
-        with TabbedContent(initial="findings"):
+        with TabbedContent(initial="vulnerabilities"):
+            with TabPane(vulns_label, id="vulnerabilities"):
+                with Horizontal(id="vulnerabilities-pane"):
+                    with Vertical(id="vulnerabilities-container"):
+                        yield VulnerabilitiesTable(self.scan_data, id="vulnerabilities-table")
+
+                    with Vertical(id="vulnerability-detail-container"):
+                        yield FindingDetailView(id="vulnerability-detail")
+
             with TabPane(findings_label, id="findings"):
                 with Horizontal(id="findings-pane"):
                     with Vertical(id="findings-container"):
@@ -1273,30 +1760,52 @@ class ScanViewerScreen(Screen):
     def on_mount(self) -> None:
         """Set up periodic refresh check"""
         self.total_events = len(self.scan_data.events)
-        # Check for updates at configured interval
-        self.refresh_timer = self.set_interval(self.refresh_interval, self.check_for_updates)
+        self.scan_status = self.scan_data.get_scan_status()
         # Update initial status
-        self.update_live_status()
+        self.update_status_display()
 
-    def watch_is_live(self, is_live: bool) -> None:
-        """React to live status changes"""
-        self.update_live_status()
+        # Only start refresh timer for RUNNING scans
+        # FINISHED and INTERRUPTED scans don't need periodic checks
+        if self.scan_status == "RUNNING":
+            self.refresh_timer = self.set_interval(self.refresh_interval, self.check_for_updates)
+
+    def watch_scan_status(self, scan_status: str) -> None:
+        """React to scan status changes"""
+        self.update_status_display()
+
+        # Stop refresh timer for FINISHED and INTERRUPTED scans to save CPU
+        if scan_status in ["FINISHED", "INTERRUPTED"]:
+            if self.refresh_timer:
+                self.refresh_timer.stop()
+                self.refresh_timer = None
+        # Restart timer if scan becomes RUNNING again (unlikely but possible)
+        elif scan_status == "RUNNING":
+            if not self.refresh_timer:
+                self.refresh_timer = self.set_interval(self.refresh_interval, self.check_for_updates)
 
     def watch_total_events(self, total_events: int) -> None:
         """React to event count changes"""
-        self.update_live_status()
+        self.update_status_display()
 
-    def update_live_status(self) -> None:
-        """Update the live status indicator"""
+    def update_status_display(self) -> None:
+        """Update the status display indicator"""
         try:
             status_widget = self.query_one("#live-status", Static)
-            if self.is_live:
+            if self.scan_status == "RUNNING":
                 status_widget.update(
-                    f"[bold green]● LIVE[/bold green] - {self.total_events:,} events (updating...)"
+                    f"[bold green]● RUNNING[/bold green] - {self.total_events:,} events (updating...)"
+                )
+            elif self.scan_status == "FINISHED":
+                status_widget.update(
+                    f"[bold blue]✓ FINISHED[/bold blue] - {self.total_events:,} events"
+                )
+            elif self.scan_status == "INTERRUPTED":
+                status_widget.update(
+                    f"[bold yellow]⚠ INTERRUPTED[/bold yellow] - {self.total_events:,} events"
                 )
             else:
                 status_widget.update(
-                    f"[dim]○ Scan[/dim] - {self.total_events:,} events"
+                    f"[dim]○ {self.scan_status}[/dim] - {self.total_events:,} events"
                 )
         except:
             pass
@@ -1311,36 +1820,71 @@ class ScanViewerScreen(Screen):
         if self.scan_data.check_for_updates():
             new_event_count = self.scan_data.load_new_events()
             if new_event_count > 0:
-                self.is_live = True
                 self.total_events = len(self.scan_data.events)
+                self.scan_status = self.scan_data.get_scan_status()
                 self.refresh_ui_components()
-        else:
-            # No updates detected, mark as not live
-            self.is_live = False
+
+        # Always update status in case it changed
+        new_status = self.scan_data.get_scan_status()
+        if new_status != self.scan_status:
+            self.scan_status = new_status
+
 
     def refresh_ui_components(self) -> None:
         """Refresh all UI components with new data"""
+        # Refresh vulnerabilities table
         try:
-            # Refresh findings table
+            vulns_table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
+            old_cursor = vulns_table.cursor_row
+            vulns_table.vulnerabilities = [
+                e for e in self.scan_data.events
+                if e.get("type") == "VULNERABILITY"
+            ]
+            # Sort vulnerabilities by severity
+            vulns_table._sort_vulnerabilities_by_severity()
+            vulns_table.clear()
+
+            # Limit to MAX_DISPLAY_ROWS for performance
+            display_vulns = vulns_table.vulnerabilities[:vulns_table.MAX_DISPLAY_ROWS]
+
+            for vuln in display_vulns:
+                from rich.text import Text
+                data = vuln.get("data", {})
+                severity = data.get("severity", "UNKNOWN")
+                host = data.get("host", "")
+                # Use Text() to treat content as plain text (no markup interpretation)
+                description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
+                url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
+                module = vuln.get("module", "")
+                vulns_table.add_row(severity, host, description, url, module)
+            # Restore cursor position if possible
+            if old_cursor < vulns_table.row_count:
+                vulns_table.move_cursor(row=old_cursor)
+        except:
+            pass
+
+        # Refresh findings table
+        try:
             findings_table = self.query_one("#findings-table", FindingsTable)
             old_cursor = findings_table.cursor_row
             findings_table.findings = [
                 e for e in self.scan_data.events
-                if e.get("type") in ["VULNERABILITY", "FINDING"]
+                if e.get("type") == "FINDING"
             ]
             findings_table.clear()
-            for finding in findings_table.findings:
+
+            # Limit to MAX_DISPLAY_ROWS for performance
+            display_findings = findings_table.findings[:findings_table.MAX_DISPLAY_ROWS]
+
+            for finding in display_findings:
+                from rich.text import Text
                 data = finding.get("data", {})
-                event_type = finding.get("type", "")
-                if event_type == "VULNERABILITY":
-                    severity = data.get("severity", "UNKNOWN")
-                else:
-                    severity = "INFO"
                 host = data.get("host", "")
-                description = data.get("description", "")[:70]
-                url = data.get("url", "")[:40]
+                # Use Text() to treat content as plain text (no markup interpretation)
+                description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
+                url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
                 module = finding.get("module", "")
-                findings_table.add_row(event_type, severity, host, description, url, module)
+                findings_table.add_row(host, description, url, module)
             # Restore cursor position if possible
             if old_cursor < findings_table.row_count:
                 findings_table.move_cursor(row=old_cursor)
@@ -1393,17 +1937,28 @@ class ScanViewerScreen(Screen):
         """Manually trigger a scan refresh"""
         new_event_count = self.scan_data.load_new_events()
         if new_event_count > 0:
-            self.is_live = True
             self.total_events = len(self.scan_data.events)
+            self.scan_status = self.scan_data.get_scan_status()
             self.refresh_ui_components()
             self.notify(f"Loaded {new_event_count} new events", timeout=2)
         else:
+            # Update status even if no new events
+            self.scan_status = self.scan_data.get_scan_status()
             self.notify("No new events", timeout=2)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         """Handle row highlight (navigation) in tables"""
         # Check which table triggered the event
-        if event.data_table.id == "findings-table":
+        if event.data_table.id == "vulnerabilities-table":
+            table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
+            row_index = event.cursor_row
+
+            if row_index < len(table.vulnerabilities):
+                selected_vuln = table.vulnerabilities[row_index]
+                detail_view = self.query_one("#vulnerability-detail", FindingDetailView)
+                detail_view.finding_json = selected_vuln
+
+        elif event.data_table.id == "findings-table":
             table = self.query_one("#findings-table", FindingsTable)
             row_index = event.cursor_row
 
@@ -1579,6 +2134,22 @@ class BBotViewer(App):
         height: 100%;
     }
 
+    #findings-filter-container {
+        height: auto;
+        padding: 1;
+        background: $panel;
+    }
+
+    #findings-severity-col {
+        height: auto;
+        width: auto;
+        margin-right: 2;
+    }
+
+    #severity-filter {
+        width: 20;
+    }
+
     #finding-detail-container {
         width: 40%;
         height: 100%;
@@ -1725,6 +2296,22 @@ class BBotViewer(App):
         overflow-y: auto;
     }
 
+    #scan-list-filter-container {
+        height: auto;
+        padding: 1;
+        background: $panel;
+    }
+
+    #scan-list-severity-col {
+        height: auto;
+        width: auto;
+        margin-right: 2;
+    }
+
+    #scan-list-severity-filter {
+        width: 20;
+    }
+
     #scan-table {
         height: 1fr;
     }
@@ -1739,7 +2326,7 @@ class BBotViewer(App):
         Binding("q", "quit", "Quit", priority=True),
     ]
 
-    def __init__(self, path: Path, scan_refresh_interval: float = None, list_refresh_interval: float = None, live_threshold: int = None):
+    def __init__(self, path: Path, scan_refresh_interval: float = None, list_refresh_interval: float = None):
         super().__init__()
         self.path = path
         self.is_directory = path.is_dir() and (path / "output.json").exists() == False
@@ -1752,14 +2339,10 @@ class BBotViewer(App):
         self.scan_refresh_interval = scan_refresh_interval if scan_refresh_interval is not None else config.get('scan_refresh_interval', 2.0)
         self.list_refresh_interval = list_refresh_interval if list_refresh_interval is not None else config.get('list_refresh_interval', 3.0)
 
-        # Live threshold (in seconds) - how recently a scan must be modified to be considered "live"
-        self.live_threshold = live_threshold if live_threshold is not None else config.get('live_threshold', 10)
-
         # Save to config if changed from defaults
-        if scan_refresh_interval is not None or list_refresh_interval is not None or live_threshold is not None:
+        if scan_refresh_interval is not None or list_refresh_interval is not None:
             config['scan_refresh_interval'] = self.scan_refresh_interval
             config['list_refresh_interval'] = self.list_refresh_interval
-            config['live_threshold'] = self.live_threshold
             self.save_config(config)
 
     def load_config(self) -> dict:
@@ -1796,7 +2379,7 @@ class BBotViewer(App):
         if self.is_directory:
             # Show scan list
             self.title = "BBOT TUI - Scan List"
-            self.push_screen(ScanListScreen(self.path, self.list_refresh_interval, self.live_threshold))
+            self.push_screen(ScanListScreen(self.path, self.list_refresh_interval))
         else:
             # Show single scan directly
             self.title = f"BBOT TUI - {self.path.name}"
@@ -1816,7 +2399,6 @@ Examples:
   %(prog)s /path/to/scans                     # Browse all scans in directory
   %(prog)s ~/.bbot/scans/example.com          # View specific scan
   %(prog)s --scan-interval 5 --list-interval 10  # Slower refresh rates
-  %(prog)s --live-threshold 30                # Mark scans as live for 30 seconds
 
 Configuration is saved to ~/.bbot_ui_config.json
         """
@@ -1841,13 +2423,6 @@ Configuration is saved to ~/.bbot_ui_config.json
         type=float,
         metavar='SECONDS',
         help='Refresh interval for scan list view in seconds (default: 3.0)'
-    )
-
-    parser.add_argument(
-        '--live-threshold',
-        type=int,
-        metavar='SECONDS',
-        help='Age threshold in seconds to mark scans as "LIVE" (default: 10)'
     )
 
     args = parser.parse_args()
@@ -1878,11 +2453,22 @@ Configuration is saved to ~/.bbot_ui_config.json
             print("Looking for directories containing output.json files")
             sys.exit(1)
 
+    # Check if psutil is available (required for accurate status detection)
+    try:
+        import psutil
+    except ImportError:
+        print("\n⚠️  WARNING: psutil is not installed in your virtual environment", file=sys.stderr)
+        print("   This is required for accurate scan status detection (RUNNING vs INTERRUPTED).", file=sys.stderr)
+        print("   Scans may show as RUNNING when they are actually INTERRUPTED.\n", file=sys.stderr)
+        print("   To fix this, reinstall the virtual environment:", file=sys.stderr)
+        print("   rm -rf ~/.bbot_ui_venv && ./bbot-ui\n", file=sys.stderr)
+        import time
+        time.sleep(3)  # Give user time to read the warning
+
     app = BBotViewer(
         path,
         scan_refresh_interval=args.scan_interval,
-        list_refresh_interval=args.list_interval,
-        live_threshold=args.live_threshold
+        list_refresh_interval=args.list_interval
     )
     app.run()
 

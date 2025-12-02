@@ -10,6 +10,7 @@ A self-contained terminal UI for browsing and analyzing [BBOT](https://www.black
 - 🔴 **Live Refresh** - Auto-updates while scans are running with accurate status detection
 - 🎯 **Smart Status Detection** - Accurately identifies RUNNING, FINISHED, and INTERRUPTED scans
 - 📋 **Scan Browser** - Navigate multiple scans with separate vulnerability/finding counts and status indicators
+- 📦 **Archive Management** - Compress old scans to save space, restore when needed
 - 🔍 **Separate Views** - Dedicated tabs for vulnerabilities (sorted by severity) and findings
 - 🌳 **Discovery Tree** - Hierarchical view showing parent-child event relationships
 - 📊 **Rich Statistics** - Beautiful tables with event distribution and scope analysis
@@ -63,7 +64,48 @@ Settings are automatically saved to `~/.bbot_ui_config.json` and used as default
 - Vulns and Findings columns show **⚠** indicator for scans with vulnerabilities/findings
 - Auto-refreshes every 3 seconds to show new scans and status changes
 - Status verified within 0.5 seconds of startup (no false "RUNNING" status)
-- `↑/↓` or `j/k` to navigate, `Enter` to open, `r` to refresh manually
+- `↑/↓` or `j/k` to navigate, `Enter` to open, `r` to refresh manually, `a` to archive, `d` to delete
+- Press `Tab` to view archived scans
+
+### Archive List
+
+- Browse all archived scans (compressed .zip files)
+- Shows: Archive Name, Size, Events, Vulns, Findings, Date Archived
+- `u` to unarchive (restore), `d` to delete permanently
+- Press `Tab`, `q`, or `Escape` to return to scan list
+
+### Archive Management
+
+Save disk space by compressing old scans into ZIP archives:
+
+**Archiving a scan:**
+1. From the scan list, navigate to the scan you want to archive
+2. Press `a` to archive
+3. Confirm the operation
+4. The scan folder is compressed to a .zip file and the original folder is deleted
+5. Archive appears in the archive list (press `Tab` to view)
+
+**Restoring an archive:**
+1. Press `Tab` to view the archive list
+2. Navigate to the archive you want to restore
+3. Press `u` to unarchive
+4. Confirm the operation
+5. The archive is extracted and the .zip file is deleted
+6. Press `q` to return to scan list and see the restored scan
+
+**Safety features:**
+- Cannot archive RUNNING scans
+- Archive integrity is verified before deleting source folder
+- Extraction is verified before deleting archive
+- All operations require confirmation
+- If any step fails, the operation is rolled back safely
+
+**Deleting scans/archives:**
+- **From scan list**: Press `d` to permanently delete a scan folder
+- **From archive list**: Press `d` to permanently delete an archive file
+- Cannot delete RUNNING scans
+- Requires confirmation (action is permanent and cannot be undone)
+- All scan data will be lost
 
 ### Scan Viewer Tabs
 
@@ -100,7 +142,7 @@ Examples:
 
 ## Keyboard Shortcuts
 
-**Navigation**: `↑/↓` or `j/k` | **Switch tabs**: `Tab` | **Search**: `f` | **Refresh**: `r` | **Adjust split**: `←/→` | **Back/Quit**: `q` or `Escape`
+**Navigation**: `↑/↓` or `j/k` | **View archives**: `Tab` (from scan list) | **Search**: `f` | **Refresh**: `r` | **Archive**: `a` (scan list) | **Unarchive**: `u` (archive list) | **Delete**: `d` | **Adjust split**: `←/→` | **Back/Quit**: `q` or `Escape`
 
 ## Live Refresh & Status Detection
 

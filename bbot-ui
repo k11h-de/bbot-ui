@@ -126,9 +126,6 @@ from textual.widgets import (
     Input,
     Label,
     Tree,
-    TabbedContent,
-    TabPane,
-    Select,
 )
 from textual.widgets.tree import TreeNode
 from textual.binding import Binding
@@ -137,6 +134,217 @@ from textual.screen import Screen
 from rich.syntax import Syntax
 from rich.json import JSON
 from rich.table import Table as RichTable
+import zipfile
+import shutil
+
+
+# ============================================================================
+# Archive Helper Functions
+# ============================================================================
+
+def create_archive(scan_path: Path) -> tuple[bool, str]:
+    """
+    Create a ZIP archive from a scan folder.
+
+    Args:
+        scan_path: Path to the scan directory to archive
+
+    Returns:
+        Tuple of (success, message)
+        - success: True if archive created successfully, False otherwise
+        - message: Error message if failed, success message if succeeded
+    """
+    try:
+        archive_path = scan_path.parent / f"{scan_path.name}.zip"
+
+        # Check if archive already exists
+        if archive_path.exists():
+            return (False, f"Archive already exists: {archive_path.name}")
+
+        # Create ZIP archive
+        with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Walk through all files in scan directory
+            for root, dirs, files in os.walk(scan_path):
+                for file in files:
+                    file_path = Path(root) / file
+                    # Calculate relative path for archive
+                    arcname = file_path.relative_to(scan_path.parent)
+                    zipf.write(file_path, arcname)
+
+        # Verify archive integrity
+        with zipfile.ZipFile(archive_path, 'r') as zipf:
+            bad_file = zipf.testzip()
+            if bad_file is not None:
+                # Archive is corrupted
+                archive_path.unlink()  # Delete bad archive
+                return (False, f"Archive verification failed: {bad_file} is corrupted")
+
+        # Archive is good, now delete the source folder
+        shutil.rmtree(scan_path)
+
+        return (True, f"Successfully archived to {archive_path.name}")
+
+    except Exception as e:
+        # Clean up incomplete archive if it exists
+        if 'archive_path' in locals() and archive_path.exists():
+            try:
+                archive_path.unlink()
+            except:
+                pass
+        return (False, f"Failed to create archive: {str(e)}")
+
+
+def extract_archive(archive_path: Path) -> tuple[bool, str]:
+    """
+    Extract a ZIP archive back to a scan folder.
+
+    Args:
+        archive_path: Path to the ZIP archive
+
+    Returns:
+        Tuple of (success, message)
+        - success: True if extracted successfully, False otherwise
+        - message: Error message if failed, success message if succeeded
+    """
+    try:
+        # Determine extraction path (remove .zip extension)
+        if not archive_path.name.endswith('.zip'):
+            return (False, "Not a ZIP file")
+
+        scan_name = archive_path.name[:-4]  # Remove .zip
+        extract_path = archive_path.parent / scan_name
+
+        # Check if directory already exists
+        if extract_path.exists():
+            return (False, f"Directory already exists: {scan_name}")
+
+        # Extract archive
+        with zipfile.ZipFile(archive_path, 'r') as zipf:
+            zipf.extractall(archive_path.parent)
+
+        # Verify extraction by checking for output.json
+        output_json = extract_path / "output.json"
+        if not output_json.exists():
+            # Extraction failed or invalid scan
+            shutil.rmtree(extract_path)
+            return (False, "Invalid scan archive: output.json not found")
+
+        # Try to read first line to verify it's valid
+        try:
+            with open(output_json, 'r') as f:
+                first_line = f.readline()
+                json.loads(first_line)
+        except:
+            # output.json is corrupted
+            shutil.rmtree(extract_path)
+            return (False, "Invalid scan archive: output.json is corrupted")
+
+        # Extraction successful, delete archive
+        archive_path.unlink()
+
+        return (True, f"Successfully restored {scan_name}")
+
+    except Exception as e:
+        # Clean up incomplete extraction if it exists
+        if 'extract_path' in locals() and extract_path.exists():
+            try:
+                shutil.rmtree(extract_path)
+            except:
+                pass
+        return (False, f"Failed to extract archive: {str(e)}")
+
+
+def get_archive_stats(archive_path: Path) -> dict:
+    """
+    Get statistics from a ZIP archive without extracting it.
+
+    Args:
+        archive_path: Path to the ZIP archive
+
+    Returns:
+        Dictionary with keys: size, date, event_count, vuln_count, finding_count
+        Returns empty dict on error
+    """
+    try:
+        stat = archive_path.stat()
+
+        stats = {
+            'size': stat.st_size,
+            'date': datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            'event_count': 0,
+            'vuln_count': 0,
+            'finding_count': 0,
+        }
+
+        # Try to read output.json from archive to get event counts
+        try:
+            with zipfile.ZipFile(archive_path, 'r') as zipf:
+                # Find output.json in archive (should be scan_name/output.json)
+                scan_name = archive_path.name[:-4]  # Remove .zip
+                output_json_path = f"{scan_name}/output.json"
+
+                if output_json_path in zipf.namelist():
+                    # Get the compressed file info
+                    file_info = zipf.getinfo(output_json_path)
+                    uncompressed_size = file_info.file_size
+
+                    with zipf.open(output_json_path, 'r') as f:
+                        # For smaller files (<1MB), count exactly
+                        if uncompressed_size < 1_000_000:
+                            content = f.read().decode('utf-8', errors='ignore')
+                            for line in content.split('\n'):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    event = json.loads(line)
+                                    event_type = event.get("type", "")
+                                    if event_type != "SCAN":
+                                        stats['event_count'] += 1
+                                    if event_type == "VULNERABILITY":
+                                        stats['vuln_count'] += 1
+                                    elif event_type == "FINDING":
+                                        stats['finding_count'] += 1
+                                except:
+                                    continue
+                        else:
+                            # For larger files, estimate based on sampling
+                            sample_size = 100000
+                            content = f.read(sample_size).decode('utf-8', errors='ignore')
+
+                            sample_events = 0
+                            sample_vulns = 0
+                            sample_findings = 0
+
+                            for line in content.split('\n'):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    event = json.loads(line)
+                                    event_type = event.get("type", "")
+                                    if event_type != "SCAN":
+                                        sample_events += 1
+                                    if event_type == "VULNERABILITY":
+                                        sample_vulns += 1
+                                    elif event_type == "FINDING":
+                                        sample_findings += 1
+                                except:
+                                    continue
+
+                            # Estimate total based on sample ratio
+                            ratio = uncompressed_size / sample_size
+                            stats['event_count'] = int(sample_events * ratio)
+                            stats['vuln_count'] = int(sample_vulns * ratio)
+                            stats['finding_count'] = int(sample_findings * ratio)
+        except:
+            # If we can't read the archive, just return basic stats
+            pass
+
+        return stats
+
+    except:
+        return {}
 
 
 class ScanData:
@@ -1103,13 +1311,16 @@ class ScanListScreen(Screen):
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit"),
         Binding("r", "refresh_scans", "Refresh"),
+        Binding("a", "archive_selected", "Archive"),
+        Binding("d", "delete_selected", "Delete"),
+        Binding("tab", "switch_to_archives", "Archives"),
     ]
 
     def __init__(self, scans_dir: Path, refresh_interval: float = 3.0):
         super().__init__()
         self.scans_dir = scans_dir
         self.refresh_interval = refresh_interval
-        self.scans = self.discover_scans(initial_load=True)  # Defer RUNNING status checks on first load
+        self.scans = self.discover_scans(initial_load=True)
         self.refresh_timer = None
         self.scan_statuses = {}  # Track scan status for each scan
         self.scan_event_counts = {}  # Cache event/vuln/finding counts for FINISHED/INTERRUPTED scans: {scan_name: (events, vulns, findings)}
@@ -1450,7 +1661,7 @@ class ScanListScreen(Screen):
 
         with Vertical():
             yield Static(
-                f"# Select a Scan\n\nFound {len(self.scans)} scans{issues_text} in {self.scans_dir}\n",
+                f"# Select a Scan\n\nFound {len(self.scans)} scans{issues_text} in {self.scans_dir}\n\nPress Tab to view archives\n",
                 id="header"
             )
             yield DataTable(id="scan-table")
@@ -1476,6 +1687,12 @@ class ScanListScreen(Screen):
         """Clean up timer when screen is removed"""
         if self.refresh_timer:
             self.refresh_timer.stop()
+
+    def on_screen_resume(self) -> None:
+        """Called when returning to this screen from another screen"""
+        # Refresh the scan list when returning from archives
+        self.scans = self.discover_scans(initial_load=False)
+        self.refresh_table()
 
     def refresh_table(self) -> None:
         """Refresh the scan table with current data"""
@@ -1601,6 +1818,97 @@ class ScanListScreen(Screen):
         else:
             self.notify("No changes detected", timeout=2)
 
+    def action_archive_selected(self) -> None:
+        """Archive the selected scan with confirmation"""
+        table = self.query_one("#scan-table", DataTable)
+
+        if table.row_count == 0:
+            self.notify("No scans to archive", severity="warning", timeout=2)
+            return
+
+        if table.cursor_row < len(self.scans):
+            selected_scan = self.scans[table.cursor_row]
+            scan_name = selected_scan["name"]
+            scan_status = selected_scan["status"]
+
+            # Don't allow archiving of RUNNING scans
+            if scan_status == "RUNNING":
+                self.notify("Cannot archive a running scan", severity="warning", timeout=3)
+                return
+
+            # Show confirmation dialog
+            self.app.push_screen(
+                ConfirmDialog(
+                    f"Archive scan '{scan_name}'?\n\nThis will compress the folder to a .zip file and remove the original.",
+                    lambda confirmed: self._handle_archive_confirmation(confirmed, selected_scan)
+                )
+            )
+
+    def _handle_archive_confirmation(self, confirmed: bool, scan: Dict[str, Any]) -> None:
+        """Handle the archive confirmation response"""
+        if not confirmed:
+            self.notify("Archive cancelled", timeout=2)
+            return
+
+        # Perform archive operation
+        scan_path = scan["path"]
+        scan_name = scan["name"]
+
+        success, message = create_archive(scan_path)
+
+        if success:
+            self.notify(message, timeout=3)
+            # Refresh the scan list
+            self.scans = self.discover_scans(initial_load=False)
+            self.refresh_table()
+        else:
+            self.notify(message, severity="error", timeout=5)
+
+    def action_delete_selected(self) -> None:
+        """Delete the selected scan with confirmation"""
+        table = self.query_one("#scan-table", DataTable)
+
+        if table.row_count == 0:
+            self.notify("No scans to delete", severity="warning", timeout=2)
+            return
+
+        if table.cursor_row < len(self.scans):
+            selected_scan = self.scans[table.cursor_row]
+            scan_name = selected_scan["name"]
+            scan_status = selected_scan["status"]
+
+            # Don't allow deleting RUNNING scans
+            if scan_status == "RUNNING":
+                self.notify("Cannot delete a running scan", severity="warning", timeout=3)
+                return
+
+            # Show confirmation dialog with warning
+            self.app.push_screen(
+                ConfirmDialog(
+                    f"⚠️  DELETE scan '{scan_name}'?\n\nThis action is PERMANENT and cannot be undone!\nAll scan data will be lost.",
+                    lambda confirmed: self._handle_delete_confirmation(confirmed, selected_scan)
+                )
+            )
+
+    def _handle_delete_confirmation(self, confirmed: bool, scan: Dict[str, Any]) -> None:
+        """Handle the delete confirmation response"""
+        if not confirmed:
+            self.notify("Delete cancelled", timeout=2)
+            return
+
+        # Perform delete operation
+        scan_path = scan["path"]
+        scan_name = scan["name"]
+
+        try:
+            shutil.rmtree(scan_path)
+            self.notify(f"Deleted scan '{scan_name}'", timeout=3)
+            # Refresh the scan list
+            self.scans = self.discover_scans(initial_load=False)
+            self.refresh_table()
+        except Exception as e:
+            self.notify(f"Failed to delete scan: {str(e)}", severity="error", timeout=5)
+
     def on_key(self, event) -> None:
         """Handle key events for wraparound navigation in scan list"""
         table = self.query_one("#scan-table", DataTable)
@@ -1613,11 +1921,275 @@ class ScanListScreen(Screen):
                 table.move_cursor(row=table.row_count - 1)
                 event.stop()
 
+    def action_switch_to_archives(self) -> None:
+        """Switch to the archives screen"""
+        self.app.push_screen(ArchivesListScreen(self.scans_dir))
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle scan selection"""
         if event.cursor_row < len(self.scans):
             selected_scan = self.scans[event.cursor_row]
             self.app.push_screen(ScanViewerScreen(selected_scan["path"]))
+
+
+class ArchivesListScreen(Screen):
+    """Screen to view and manage archived scans"""
+
+    BINDINGS = [
+        Binding("q", "quit_archives", "Back to Scans"),
+        Binding("escape", "quit_archives", "Back to Scans"),
+        Binding("tab", "quit_archives", "Back to Scans"),
+        Binding("r", "refresh_archives", "Refresh"),
+        Binding("u", "unarchive_selected", "Unarchive"),
+        Binding("d", "delete_selected", "Delete"),
+    ]
+
+    def __init__(self, scans_dir: Path):
+        super().__init__()
+        self.scans_dir = scans_dir
+        self.archives = self.discover_archives()
+
+    def discover_archives(self) -> List[Dict[str, Any]]:
+        """Discover all ZIP archives in the scans directory"""
+        archives = []
+
+        for archive_path in sorted(self.scans_dir.iterdir()):
+            # Only process .zip files
+            if not archive_path.is_file() or not archive_path.name.endswith('.zip'):
+                continue
+
+            # Skip hidden files
+            if archive_path.name.startswith('.'):
+                continue
+
+            # Get archive statistics
+            stats = get_archive_stats(archive_path)
+            if not stats:
+                continue
+
+            # Format size for display
+            size_mb = stats['size'] / (1024 * 1024)
+            if size_mb < 1:
+                size_str = f"{stats['size'] / 1024:.1f} KB"
+            else:
+                size_str = f"{size_mb:.1f} MB"
+
+            archives.append({
+                "name": archive_path.name[:-4],  # Remove .zip extension
+                "path": archive_path,
+                "size": size_str,
+                "date": stats['date'],
+                "event_count": stats['event_count'],
+                "vuln_count": stats['vuln_count'],
+                "finding_count": stats['finding_count'],
+            })
+
+        return archives
+
+    def compose(self) -> ComposeResult:
+        """Create the archives list UI"""
+        yield Header()
+
+        # Calculate totals
+        total_vulns = sum(archive["vuln_count"] for archive in self.archives)
+        total_findings = sum(archive["finding_count"] for archive in self.archives)
+
+        issues_text = ""
+        if total_vulns > 0 or total_findings > 0:
+            issues_text = f" ({total_vulns} vulns, {total_findings} findings)"
+
+        with Vertical():
+            yield Static(
+                f"# Archived Scans\n\nFound {len(self.archives)} archived scans{issues_text} in {self.scans_dir}\n\nPress 'u' to unarchive, Tab or 'q' to go back\n",
+                id="archive-header"
+            )
+            yield DataTable(id="archive-table")
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        """Set up the archive table"""
+        table = self.query_one("#archive-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Archive Name", "Size", "Events", "Vulns", "Findings", "Date Archived")
+
+        self.refresh_table()
+
+    def refresh_table(self) -> None:
+        """Refresh the archive table with current data"""
+        table = self.query_one("#archive-table", DataTable)
+        old_cursor = table.cursor_row
+
+        # Clear and rebuild table
+        table.clear()
+
+        for archive in self.archives:
+            archive_name = archive["name"]
+
+            # Format vulnerability count with highlighting if > 0
+            vulns_str = str(archive["vuln_count"])
+            if archive["vuln_count"] > 0:
+                vulns_str = f"[red]⚠ {vulns_str}[/red]"
+
+            # Format findings count with highlighting if > 0
+            findings_str = str(archive["finding_count"])
+            if archive["finding_count"] > 0:
+                findings_str = f"[yellow]⚠ {findings_str}[/yellow]"
+
+            table.add_row(
+                archive_name,
+                archive["size"],
+                str(archive["event_count"]),
+                vulns_str,
+                findings_str,
+                archive["date"],
+            )
+
+        # Restore cursor position if possible
+        if old_cursor < table.row_count:
+            table.move_cursor(row=old_cursor)
+
+    def action_refresh_archives(self) -> None:
+        """Manually refresh the archive list"""
+        old_count = len(self.archives)
+        self.archives = self.discover_archives()
+        new_count = len(self.archives)
+        self.refresh_table()
+
+        if new_count > old_count:
+            self.notify(f"Found {new_count - old_count} new archive(s)", timeout=2)
+        elif new_count < old_count:
+            self.notify(f"Removed {old_count - new_count} archive(s)", timeout=2)
+        else:
+            self.notify("No changes detected", timeout=2)
+
+    def action_unarchive_selected(self) -> None:
+        """Unarchive the selected archive with confirmation"""
+        table = self.query_one("#archive-table", DataTable)
+
+        if table.row_count == 0:
+            self.notify("No archives to unarchive", severity="warning", timeout=2)
+            return
+
+        if table.cursor_row < len(self.archives):
+            selected_archive = self.archives[table.cursor_row]
+            archive_name = selected_archive["name"]
+
+            # Show confirmation dialog
+            self.app.push_screen(
+                ConfirmDialog(
+                    f"Restore archive '{archive_name}.zip'?\n\nThis will extract the scan and remove the archive file.",
+                    lambda confirmed: self._handle_unarchive_confirmation(confirmed, selected_archive)
+                )
+            )
+
+    def _handle_unarchive_confirmation(self, confirmed: bool, archive: Dict[str, Any]) -> None:
+        """Handle the unarchive confirmation response"""
+        if not confirmed:
+            self.notify("Unarchive cancelled", timeout=2)
+            return
+
+        # Perform unarchive operation
+        archive_path = archive["path"]
+        archive_name = archive["name"]
+
+        success, message = extract_archive(archive_path)
+
+        if success:
+            self.notify(message, timeout=3)
+            # Refresh the archive list
+            self.archives = self.discover_archives()
+            self.refresh_table()
+        else:
+            self.notify(message, severity="error", timeout=5)
+
+    def action_delete_selected(self) -> None:
+        """Delete the selected archive with confirmation"""
+        table = self.query_one("#archive-table", DataTable)
+
+        if table.row_count == 0:
+            self.notify("No archives to delete", severity="warning", timeout=2)
+            return
+
+        if table.cursor_row < len(self.archives):
+            selected_archive = self.archives[table.cursor_row]
+            archive_name = selected_archive["name"]
+
+            # Show confirmation dialog with warning
+            self.app.push_screen(
+                ConfirmDialog(
+                    f"⚠️  DELETE archive '{archive_name}.zip'?\n\nThis action is PERMANENT and cannot be undone!\nThe archived scan data will be lost.",
+                    lambda confirmed: self._handle_delete_archive_confirmation(confirmed, selected_archive)
+                )
+            )
+
+    def _handle_delete_archive_confirmation(self, confirmed: bool, archive: Dict[str, Any]) -> None:
+        """Handle the delete archive confirmation response"""
+        if not confirmed:
+            self.notify("Delete cancelled", timeout=2)
+            return
+
+        # Perform delete operation
+        archive_path = archive["path"]
+        archive_name = archive["name"]
+
+        try:
+            archive_path.unlink()
+            self.notify(f"Deleted archive '{archive_name}.zip'", timeout=3)
+            # Refresh the archive list
+            self.archives = self.discover_archives()
+            self.refresh_table()
+        except Exception as e:
+            self.notify(f"Failed to delete archive: {str(e)}", severity="error", timeout=5)
+
+    def action_quit_archives(self) -> None:
+        """Return to scan list"""
+        self.app.pop_screen()
+
+    def on_key(self, event) -> None:
+        """Handle key events for wraparound navigation in archive list"""
+        table = self.query_one("#archive-table", DataTable)
+        if event.key == "down" or event.key == "j":
+            if table.cursor_row == table.row_count - 1:
+                table.move_cursor(row=0)
+                event.stop()
+        elif event.key == "up" or event.key == "k":
+            if table.cursor_row == 0:
+                table.move_cursor(row=table.row_count - 1)
+                event.stop()
+
+
+class ConfirmDialog(Screen):
+    """Modal dialog for confirmation"""
+
+    def __init__(self, message: str, callback):
+        super().__init__()
+        self.message = message
+        self.callback = callback
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static(self.message, id="dialog-message")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Cancel", variant="default", id="cancel-button")
+                yield Button("Confirm", variant="primary", id="confirm-button")
+
+    def on_mount(self) -> None:
+        """Focus confirm button on mount"""
+        self.query_one("#confirm-button", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button press"""
+        confirmed = event.button.id == "confirm-button"
+        self.app.pop_screen()
+        self.callback(confirmed)
+
+    def on_key(self, event) -> None:
+        """Handle escape key"""
+        if event.key == "escape":
+            self.app.pop_screen()
+            self.callback(False)
+            event.stop()
 
 
 class ScanViewerScreen(Screen):
@@ -2296,22 +2868,6 @@ class BBotViewer(App):
         overflow-y: auto;
     }
 
-    #scan-list-filter-container {
-        height: auto;
-        padding: 1;
-        background: $panel;
-    }
-
-    #scan-list-severity-col {
-        height: auto;
-        width: auto;
-        margin-right: 2;
-    }
-
-    #scan-list-severity-filter {
-        width: 20;
-    }
-
     #scan-table {
         height: 1fr;
     }
@@ -2319,6 +2875,41 @@ class BBotViewer(App):
     #header {
         padding: 1;
         background: $panel;
+    }
+
+    #archive-header {
+        padding: 1;
+        background: $panel;
+    }
+
+    #archive-table {
+        height: 1fr;
+    }
+
+    #dialog {
+        align: center middle;
+        width: 60;
+        height: auto;
+        padding: 2;
+        background: $panel;
+        border: thick $accent;
+    }
+
+    #dialog-message {
+        width: 100%;
+        height: auto;
+        margin-bottom: 1;
+        text-align: center;
+    }
+
+    #dialog-buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+    }
+
+    #dialog-buttons Button {
+        margin: 0 1;
     }
     """
 
@@ -2378,7 +2969,7 @@ class BBotViewer(App):
 
         if self.is_directory:
             # Show scan list
-            self.title = "BBOT TUI - Scan List"
+            self.title = "BBOT TUI - Scan Manager"
             self.push_screen(ScanListScreen(self.path, self.list_refresh_interval))
         else:
             # Show single scan directly

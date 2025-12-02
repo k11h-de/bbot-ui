@@ -186,10 +186,11 @@ self.app.push_screen(
 
 ### Code Cleanup
 - Removed unused severity filter functionality
-- Removed failed widget/tab approach artifacts
-- Cleaned up unused CSS rules and imports
-- Removed: `TabbedContent`, `TabPane`, `Select` imports
+- Removed failed widget/tab approach artifacts (MainScreen with embedded widgets)
+- Cleaned up unused CSS rules
+- Removed: `Select` import (was for severity filter)
 - Removed: MainScreen, ScanListWidget, ArchivesListWidget classes
+- **Note:** `TabbedContent` and `TabPane` are still used in ScanViewerScreen for its internal tabs
 
 ## Important Implementation Patterns
 

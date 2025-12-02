@@ -126,6 +126,8 @@ from textual.widgets import (
     Input,
     Label,
     Tree,
+    TabbedContent,
+    TabPane,
 )
 from textual.widgets.tree import TreeNode
 from textual.binding import Binding

@@ -185,12 +185,14 @@ self.app.push_screen(
   - Press 'q' from archive list also returns to scans
 
 ### Code Cleanup
-- Removed unused severity filter functionality
-- Removed failed widget/tab approach artifacts (MainScreen with embedded widgets)
-- Cleaned up unused CSS rules
-- Removed: `Select` import (was for severity filter)
-- Removed: MainScreen, ScanListWidget, ArchivesListWidget classes
-- **Note:** `TabbedContent` and `TabPane` are still used in ScanViewerScreen for its internal tabs
+**Removed:**
+- Severity filter functionality (--min-severity CLI option and UI filter)
+- Failed MainScreen with embedded widgets approach (ScanListWidget, ArchivesListWidget)
+- Unused CSS rules: `#scan-list-filter-container`, `#scan-list-severity-col`, `#scan-list-severity-filter`
+
+**Still in use:**
+- `TabbedContent` and `TabPane` - for ScanViewerScreen's 6 internal tabs
+- `Select` widget - for event type filter in Events tab
 
 ## Important Implementation Patterns
 

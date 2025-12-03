@@ -1676,11 +1676,27 @@ class SubdomainsTree(Tree):
             # Create root domain node
             root_node = self.root.add(root_domain)
 
-            # Add subdomains under root
-            for subdomain in sorted(subdomains):
-                if subdomain != root_domain:
-                    # Build hierarchy for this subdomain
-                    self._add_subdomain_hierarchy(root_node, subdomain, root_domain)
+            # Filter to only leaf subdomains (those without children in the list)
+            # This prevents duplicates when building the hierarchy
+            leaf_subdomains = []
+
+            for subdomain in subdomains:
+                if subdomain == root_domain:
+                    continue
+
+                # Check if this subdomain has any children in the list
+                is_leaf = True
+                for other in subdomains:
+                    if other != subdomain and other.endswith('.' + subdomain):
+                        is_leaf = False
+                        break
+
+                if is_leaf:
+                    leaf_subdomains.append(subdomain)
+
+            # Add only leaf subdomains - hierarchy will be built automatically
+            for subdomain in sorted(leaf_subdomains):
+                self._add_subdomain_hierarchy(root_node, subdomain, root_domain)
 
             root_node.expand()
 

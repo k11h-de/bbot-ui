@@ -350,6 +350,134 @@ def get_archive_stats(archive_path: Path) -> dict:
         return {}
 
 
+# ============================================================================
+# Annotation System
+# ============================================================================
+
+# Status options (single choice)
+STATUS_OPTIONS = {
+    "new": {"label": "🆕 New", "color": "gray"},
+    "investigating": {"label": "🔍 Investigating", "color": "yellow"},
+    "confirmed": {"label": "✓ Confirmed", "color": "red"},
+    "false-positive": {"label": "✗ False Positive", "color": "green"},
+    "reported": {"label": "📢 Reported", "color": "blue"},
+    "fixed": {"label": "🔧 Fixed", "color": "bright_green"},
+    "accepted-risk": {"label": "⚠ Accepted Risk", "color": "magenta"},
+}
+
+# Priority options (single choice, optional)
+PRIORITY_OPTIONS = {
+    "critical": {"label": "🔴 Critical", "color": "red"},
+    "high": {"label": "🟠 High", "color": "bright_red"},
+    "medium": {"label": "🟡 Medium", "color": "yellow"},
+    "low": {"label": "🟢 Low", "color": "green"},
+}
+
+# Custom tags (multi-choice, optional)
+CUSTOM_TAGS = [
+    "reviewed",
+    "needs-validation",
+    "duplicate",
+    "needs-retest",
+    "escalated",
+]
+
+# Actionable statuses (items that still need work/attention)
+ACTIONABLE_STATUSES = ["new", "investigating", "confirmed", "reported"]
+
+
+class AnnotationManager:
+    """Manages annotations for a scan"""
+
+    def __init__(self, scan_path: Path):
+        self.scan_path = scan_path
+        self.annotation_file = scan_path / ".bbot_ui_annotations.json"
+        self.annotations = self.load()
+
+    def _create_empty(self) -> dict:
+        """Create empty annotation structure"""
+        return {
+            "version": "1.0",
+            "scan_name": self.scan_path.name,
+            "created_at": datetime.utcnow().isoformat() + 'Z',
+            "updated_at": datetime.utcnow().isoformat() + 'Z',
+            "annotations": {}
+        }
+
+    def load(self) -> dict:
+        """Load annotations from file"""
+        if not self.annotation_file.exists():
+            return self._create_empty()
+
+        try:
+            with self.annotation_file.open('r') as f:
+                return json.load(f)
+        except:
+            # If file is corrupted, start fresh
+            return self._create_empty()
+
+    def save(self):
+        """Save annotations to file"""
+        self.annotations['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+        try:
+            with self.annotation_file.open('w') as f:
+                json.dump(self.annotations, f, indent=2)
+        except Exception as e:
+            # Log error but don't crash
+            pass
+
+    def get_annotation(self, uuid: str) -> dict:
+        """Get annotation for event UUID"""
+        return self.annotations['annotations'].get(uuid, {})
+
+    def set_annotation(self, uuid: str, status: str = None,
+                      priority: str = None, custom_tags: list = None,
+                      note: str = None):
+        """Set or update annotation"""
+        if uuid not in self.annotations['annotations']:
+            self.annotations['annotations'][uuid] = {
+                'created_at': datetime.utcnow().isoformat() + 'Z'
+            }
+
+        ann = self.annotations['annotations'][uuid]
+
+        if status is not None:
+            ann['status'] = status
+        if priority is not None:
+            ann['priority'] = priority
+        if custom_tags is not None:
+            ann['custom_tags'] = custom_tags
+        if note is not None:
+            ann['note'] = note
+
+        ann['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+        self.save()
+
+    def delete_annotation(self, uuid: str):
+        """Remove annotation"""
+        if uuid in self.annotations['annotations']:
+            del self.annotations['annotations'][uuid]
+            self.save()
+
+    def get_stats(self) -> dict:
+        """Get annotation statistics"""
+        stats = {
+            'total': len(self.annotations['annotations']),
+            'by_status': {},
+            'by_priority': {},
+        }
+
+        for ann in self.annotations['annotations'].values():
+            status = ann.get('status', 'new')
+            stats['by_status'][status] = stats['by_status'].get(status, 0) + 1
+
+            if 'priority' in ann:
+                priority = ann['priority']
+                stats['by_priority'][priority] = stats['by_priority'].get(priority, 0) + 1
+
+        return stats
+
+
 class ScanData:
     """Parse and manage BBOT scan data"""
 
@@ -362,6 +490,7 @@ class ScanData:
         self.file_position: int = 0  # Track position in output.json for incremental reads
         self.file_handler_cache = None  # Cache for file handler check: (result, timestamp)
         self.cache_ttl = 5.0  # Cache results for 5 seconds
+        self.annotation_manager = AnnotationManager(scan_path)  # Annotation system
         self.load_events()
         self.load_preset()
 
@@ -585,6 +714,66 @@ class StatisticsView(VerticalScroll):
         header += f"[dim]Total Events:[/dim] [bold green]{stats['total_events']:,}[/bold green]\n"
         self.mount(Static(header))
 
+        # Workflow Status Table (Annotations) - Show at top
+        annotation_stats = self.scan_data.annotation_manager.get_stats()
+        if annotation_stats['total'] > 0:
+            workflow_table = RichTable(
+                title="📝 Workflow Status (Annotations)",
+                show_header=True,
+                header_style="bold magenta",
+                border_style="cyan",
+                title_style="bold white"
+            )
+            workflow_table.add_column("Status", style="cyan", no_wrap=True)
+            workflow_table.add_column("Count", justify="right", style="green")
+            workflow_table.add_column("Percentage", justify="right", style="yellow")
+            workflow_table.add_column("Bar", style="blue")
+
+            total_annotated = annotation_stats['total']
+            for status_key, count in sorted(
+                annotation_stats['by_status'].items(), key=lambda x: x[1], reverse=True
+            ):
+                status_label = STATUS_OPTIONS.get(status_key, {}).get('label', status_key)
+                percentage = (count / total_annotated * 100) if total_annotated > 0 else 0
+                bar_length = int(percentage / 2)  # Scale to max 50 chars
+                bar = "█" * bar_length
+                workflow_table.add_row(
+                    status_label,
+                    f"{count:,}",
+                    f"{percentage:.1f}%",
+                    bar
+                )
+
+            self.mount(Static(workflow_table))
+
+            # Priority Distribution Table (if any priorities set)
+            if annotation_stats['by_priority']:
+                priority_table = RichTable(
+                    title="⚡ Priority Distribution",
+                    show_header=True,
+                    header_style="bold magenta",
+                    border_style="red",
+                    title_style="bold white"
+                )
+                priority_table.add_column("Priority", style="cyan", no_wrap=True)
+                priority_table.add_column("Count", justify="right", style="green")
+                priority_table.add_column("Percentage", justify="right", style="yellow")
+
+                total_with_priority = sum(annotation_stats['by_priority'].values())
+                for priority_key, count in sorted(
+                    annotation_stats['by_priority'].items(),
+                    key=lambda x: ['critical', 'high', 'medium', 'low'].index(x[0]) if x[0] in ['critical', 'high', 'medium', 'low'] else 99
+                ):
+                    priority_label = PRIORITY_OPTIONS.get(priority_key, {}).get('label', priority_key)
+                    percentage = (count / total_with_priority * 100) if total_with_priority > 0 else 0
+                    priority_table.add_row(
+                        priority_label,
+                        f"{count:,}",
+                        f"{percentage:.1f}%"
+                    )
+
+                self.mount(Static(priority_table))
+
         # Event Types Table
         event_table = RichTable(
             title="📊 Event Types Distribution",
@@ -717,6 +906,8 @@ class VulnerabilitiesTable(DataTable):
             e for e in scan_data.events
             if e.get("type") == "VULNERABILITY"
         ]
+        # Track the currently filtered/displayed vulnerabilities
+        self.filtered_vulnerabilities = self.vulnerabilities
         self.cursor_type = "row"
 
     def _get_severity(self, vuln: Dict[str, Any]) -> str:
@@ -732,7 +923,7 @@ class VulnerabilitiesTable(DataTable):
 
     def on_mount(self) -> None:
         """Set up the vulnerabilities table"""
-        self.add_columns("Severity", "Host", "Description", "URL", "Module")
+        self.add_columns("Severity", "Host", "Status", "Priority", "Module")
 
         # Sort vulnerabilities by severity before displaying
         self._sort_vulnerabilities_by_severity()
@@ -741,16 +932,78 @@ class VulnerabilitiesTable(DataTable):
         display_vulns = self.vulnerabilities[:self.MAX_DISPLAY_ROWS]
 
         for vuln in display_vulns:
-            from rich.text import Text
             data = vuln.get("data", {})
             severity = data.get("severity", "UNKNOWN")
             host = data.get("host", "")
-            # Use Text.from_markup() with escape to prevent bracket interpretation
-            description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
-            url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
             module = vuln.get("module", "")
 
-            self.add_row(severity, host, description, url, module)
+            # Get annotation status
+            uuid = vuln.get("uuid", "")
+            annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+            status = annotation.get('status', 'new')
+            priority = annotation.get('priority', '')
+
+            status_label = STATUS_OPTIONS.get(status, STATUS_OPTIONS['new'])['label']
+            priority_label = PRIORITY_OPTIONS.get(priority, {}).get('label', '') if priority else ''
+
+            self.add_row(severity, host, status_label, priority_label, module)
+
+    def filter_by_status(self, status_filter: str) -> None:
+        """Filter vulnerabilities by annotation status"""
+        old_cursor = self.cursor_row
+
+        # Sort vulnerabilities by severity first
+        self._sort_vulnerabilities_by_severity()
+
+        # Apply status filter
+        if status_filter == "All":
+            filtered_vulns = self.vulnerabilities
+        elif status_filter == "Actionable":
+            # Filter to only actionable items (items that need work)
+            filtered_vulns = []
+            for vuln in self.vulnerabilities:
+                uuid = vuln.get("uuid", "")
+                annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+                vuln_status = annotation.get('status', 'new')
+                if vuln_status in ACTIONABLE_STATUSES:
+                    filtered_vulns.append(vuln)
+        else:
+            # Filter by specific status
+            filtered_vulns = []
+            for vuln in self.vulnerabilities:
+                uuid = vuln.get("uuid", "")
+                annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+                vuln_status = annotation.get('status', 'new')
+                if vuln_status == status_filter:
+                    filtered_vulns.append(vuln)
+
+        # Store the filtered list for later access
+        self.filtered_vulnerabilities = filtered_vulns
+
+        # Clear and rebuild table
+        self.clear()
+        display_vulns = filtered_vulns[:self.MAX_DISPLAY_ROWS]
+
+        for vuln in display_vulns:
+            data = vuln.get("data", {})
+            severity = data.get("severity", "UNKNOWN")
+            host = data.get("host", "")
+            module = vuln.get("module", "")
+
+            # Get annotation status
+            uuid = vuln.get("uuid", "")
+            annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+            status = annotation.get('status', 'new')
+            priority = annotation.get('priority', '')
+
+            status_label = STATUS_OPTIONS.get(status, STATUS_OPTIONS['new'])['label']
+            priority_label = PRIORITY_OPTIONS.get(priority, {}).get('label', '') if priority else ''
+
+            self.add_row(severity, host, status_label, priority_label, module)
+
+        # Restore cursor position if possible
+        if old_cursor < self.row_count:
+            self.move_cursor(row=old_cursor)
 
     def on_key(self, event) -> None:
         """Handle key events for wraparound navigation"""
@@ -778,25 +1031,85 @@ class FindingsTable(DataTable):
             e for e in scan_data.events
             if e.get("type") == "FINDING"
         ]
+        # Track the currently filtered/displayed findings
+        self.filtered_findings = self.findings
         self.cursor_type = "row"
 
     def on_mount(self) -> None:
         """Set up the findings table"""
-        self.add_columns("Host", "Description", "URL", "Module")
+        self.add_columns("Host", "Status", "Priority", "Module")
 
         # Limit to MAX_DISPLAY_ROWS for performance
         display_findings = self.findings[:self.MAX_DISPLAY_ROWS]
 
         for finding in display_findings:
-            from rich.text import Text
             data = finding.get("data", {})
             host = data.get("host", "")
-            # Use Text() to treat content as plain text (no markup interpretation)
-            description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
-            url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
             module = finding.get("module", "")
 
-            self.add_row(host, description, url, module)
+            # Get annotation status
+            uuid = finding.get("uuid", "")
+            annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+            status = annotation.get('status', 'new')
+            priority = annotation.get('priority', '')
+
+            status_label = STATUS_OPTIONS.get(status, STATUS_OPTIONS['new'])['label']
+            priority_label = PRIORITY_OPTIONS.get(priority, {}).get('label', '') if priority else ''
+
+            self.add_row(host, status_label, priority_label, module)
+
+    def filter_by_status(self, status_filter: str) -> None:
+        """Filter findings by annotation status"""
+        old_cursor = self.cursor_row
+
+        # Apply status filter
+        if status_filter == "All":
+            filtered_findings = self.findings
+        elif status_filter == "Actionable":
+            # Filter to only actionable items (items that need work)
+            filtered_findings = []
+            for finding in self.findings:
+                uuid = finding.get("uuid", "")
+                annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+                finding_status = annotation.get('status', 'new')
+                if finding_status in ACTIONABLE_STATUSES:
+                    filtered_findings.append(finding)
+        else:
+            # Filter by specific status
+            filtered_findings = []
+            for finding in self.findings:
+                uuid = finding.get("uuid", "")
+                annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+                finding_status = annotation.get('status', 'new')
+                if finding_status == status_filter:
+                    filtered_findings.append(finding)
+
+        # Store the filtered list for later access
+        self.filtered_findings = filtered_findings
+
+        # Clear and rebuild table
+        self.clear()
+        display_findings = filtered_findings[:self.MAX_DISPLAY_ROWS]
+
+        for finding in display_findings:
+            data = finding.get("data", {})
+            host = data.get("host", "")
+            module = finding.get("module", "")
+
+            # Get annotation status
+            uuid = finding.get("uuid", "")
+            annotation = self.scan_data.annotation_manager.get_annotation(uuid)
+            status = annotation.get('status', 'new')
+            priority = annotation.get('priority', '')
+
+            status_label = STATUS_OPTIONS.get(status, STATUS_OPTIONS['new'])['label']
+            priority_label = PRIORITY_OPTIONS.get(priority, {}).get('label', '') if priority else ''
+
+            self.add_row(host, status_label, priority_label, module)
+
+        # Restore cursor position if possible
+        if old_cursor < self.row_count:
+            self.move_cursor(row=old_cursor)
 
     def on_key(self, event) -> None:
         """Handle key events for wraparound navigation"""
@@ -2195,6 +2508,100 @@ class ConfirmDialog(Screen):
             event.stop()
 
 
+class AnnotationDialog(Screen):
+    """Modal dialog for editing event annotations"""
+
+    def __init__(self, event_data: dict, current_annotation: dict, callback):
+        super().__init__()
+        self.event_data = event_data
+        self.current_annotation = current_annotation
+        self.callback = callback
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="annotation-dialog"):
+            # Title showing event type and host
+            event_type = self.event_data.get('type', 'EVENT')
+            host = self.event_data.get('data', {}).get('host', '')
+            yield Static(f"{event_type} - {host}", id="annotation-title")
+
+            # Event description (truncated)
+            description = self.event_data.get('data', {}).get('description', '')[:80]
+            yield Static(description, id="annotation-description")
+
+            # Status selector
+            yield Label("Status:")
+            status_options = [(v['label'], k) for k, v in STATUS_OPTIONS.items()]
+            current_status = self.current_annotation.get('status', 'new')
+            yield Select(
+                options=status_options,
+                value=current_status,
+                id="status-select"
+            )
+
+            # Priority selector (optional)
+            yield Label("Priority (optional):")
+            priority_options = [("(none)", "")] + [(v['label'], k) for k, v in PRIORITY_OPTIONS.items()]
+            current_priority = self.current_annotation.get('priority', '')
+            yield Select(
+                options=priority_options,
+                value=current_priority,
+                id="priority-select"
+            )
+
+            # Note input
+            yield Label("Notes:")
+            current_note = self.current_annotation.get('note', '')
+            yield Input(
+                value=current_note,
+                placeholder="Add notes about this finding...",
+                id="note-input"
+            )
+
+            # Buttons
+            with Horizontal(id="annotation-buttons"):
+                yield Button("Cancel", variant="default", id="cancel-button")
+                if self.current_annotation:
+                    yield Button("Clear", variant="warning", id="clear-button")
+                yield Button("Save", variant="primary", id="save-button")
+
+    def on_mount(self) -> None:
+        """Focus save button on mount"""
+        self.query_one("#save-button", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button press"""
+        button_id = event.button.id
+
+        if button_id == "cancel-button":
+            self.app.pop_screen()
+            self.callback(None)
+        elif button_id == "clear-button":
+            # Clear annotation
+            self.app.pop_screen()
+            self.callback({})
+        elif button_id == "save-button":
+            # Collect form data
+            status_select = self.query_one("#status-select", Select)
+            priority_select = self.query_one("#priority-select", Select)
+            note_input = self.query_one("#note-input", Input)
+
+            annotation_data = {
+                'status': status_select.value,
+                'priority': priority_select.value if priority_select.value else None,
+                'note': note_input.value if note_input.value else None,
+            }
+
+            self.app.pop_screen()
+            self.callback(annotation_data)
+
+    def on_key(self, event) -> None:
+        """Handle escape key"""
+        if event.key == "escape":
+            self.app.pop_screen()
+            self.callback(None)
+            event.stop()
+
+
 class ScanViewerScreen(Screen):
     """Screen to view a single scan"""
 
@@ -2205,6 +2612,9 @@ class ScanViewerScreen(Screen):
         Binding("left", "adjust_split_left", "Split ←"),
         Binding("right", "adjust_split_right", "Split →"),
         Binding("r", "refresh_scan", "Refresh"),
+        Binding("t", "annotate_selected", "Annotate"),
+        Binding("x", "mark_false_positive", "False Positive"),
+        Binding("i", "mark_accepted_risk", "Accepted Risk"),
     ]
 
     split_ratio = reactive(60)  # Default 60% for main panel
@@ -2219,6 +2629,8 @@ class ScanViewerScreen(Screen):
         self.current_scope_filter = None  # None means "all"
         self.tree_type_filter = "All"
         self.tree_scope_filter = None  # None means "all"
+        self.vulnerabilities_status_filter = "Actionable"  # Status filter for vulnerabilities (default to actionable)
+        self.findings_status_filter = "Actionable"  # Status filter for findings (default to actionable)
         self.refresh_timer = None
 
     def compose(self) -> ComposeResult:
@@ -2249,6 +2661,20 @@ class ScanViewerScreen(Screen):
             with TabPane(vulns_label, id="vulnerabilities"):
                 with Horizontal(id="vulnerabilities-pane"):
                     with Vertical(id="vulnerabilities-container"):
+                        with Horizontal(id="vulnerabilities-filter-container"):
+                            with Vertical(id="vulnerabilities-status-col"):
+                                yield Label("Status:")
+                                # Create status filter options
+                                status_filter_options = [
+                                    ("All", "All"),
+                                    ("⚡ Actionable", "Actionable")
+                                ] + [(v['label'], k) for k, v in STATUS_OPTIONS.items()]
+                                yield Select(
+                                    options=status_filter_options,
+                                    value="Actionable",
+                                    allow_blank=False,
+                                    id="vulnerabilities-status-filter",
+                                )
                         yield VulnerabilitiesTable(self.scan_data, id="vulnerabilities-table")
 
                     with Vertical(id="vulnerability-detail-container"):
@@ -2257,6 +2683,20 @@ class ScanViewerScreen(Screen):
             with TabPane(findings_label, id="findings"):
                 with Horizontal(id="findings-pane"):
                     with Vertical(id="findings-container"):
+                        with Horizontal(id="findings-filter-container"):
+                            with Vertical(id="findings-status-col"):
+                                yield Label("Status:")
+                                # Create status filter options
+                                status_filter_options = [
+                                    ("All", "All"),
+                                    ("⚡ Actionable", "Actionable")
+                                ] + [(v['label'], k) for k, v in STATUS_OPTIONS.items()]
+                                yield Select(
+                                    options=status_filter_options,
+                                    value="Actionable",
+                                    allow_blank=False,
+                                    id="findings-status-filter",
+                                )
                         yield FindingsTable(self.scan_data, id="findings-table")
 
                     with Vertical(id="finding-detail-container"):
@@ -2339,6 +2779,19 @@ class ScanViewerScreen(Screen):
         # Update initial status
         self.update_status_display()
 
+        # Apply default "Actionable" filter to tables
+        try:
+            vulns_table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
+            vulns_table.filter_by_status(self.vulnerabilities_status_filter)
+        except:
+            pass
+
+        try:
+            findings_table = self.query_one("#findings-table", FindingsTable)
+            findings_table.filter_by_status(self.findings_status_filter)
+        except:
+            pass
+
         # Only start refresh timer for RUNNING scans
         # FINISHED and INTERRUPTED scans don't need periodic checks
         if self.scan_status == "RUNNING":
@@ -2410,59 +2863,26 @@ class ScanViewerScreen(Screen):
         # Refresh vulnerabilities table
         try:
             vulns_table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
-            old_cursor = vulns_table.cursor_row
+            # Update the full vulnerabilities list
             vulns_table.vulnerabilities = [
                 e for e in self.scan_data.events
                 if e.get("type") == "VULNERABILITY"
             ]
-            # Sort vulnerabilities by severity
-            vulns_table._sort_vulnerabilities_by_severity()
-            vulns_table.clear()
-
-            # Limit to MAX_DISPLAY_ROWS for performance
-            display_vulns = vulns_table.vulnerabilities[:vulns_table.MAX_DISPLAY_ROWS]
-
-            for vuln in display_vulns:
-                from rich.text import Text
-                data = vuln.get("data", {})
-                severity = data.get("severity", "UNKNOWN")
-                host = data.get("host", "")
-                # Use Text() to treat content as plain text (no markup interpretation)
-                description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
-                url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
-                module = vuln.get("module", "")
-                vulns_table.add_row(severity, host, description, url, module)
-            # Restore cursor position if possible
-            if old_cursor < vulns_table.row_count:
-                vulns_table.move_cursor(row=old_cursor)
+            # Re-apply the current filter (this will also sort and update filtered_vulnerabilities)
+            vulns_table.filter_by_status(self.vulnerabilities_status_filter)
         except:
             pass
 
         # Refresh findings table
         try:
             findings_table = self.query_one("#findings-table", FindingsTable)
-            old_cursor = findings_table.cursor_row
+            # Update the full findings list
             findings_table.findings = [
                 e for e in self.scan_data.events
                 if e.get("type") == "FINDING"
             ]
-            findings_table.clear()
-
-            # Limit to MAX_DISPLAY_ROWS for performance
-            display_findings = findings_table.findings[:findings_table.MAX_DISPLAY_ROWS]
-
-            for finding in display_findings:
-                from rich.text import Text
-                data = finding.get("data", {})
-                host = data.get("host", "")
-                # Use Text() to treat content as plain text (no markup interpretation)
-                description = Text(data.get("description", "")[:70], no_wrap=True, overflow="ellipsis")
-                url = Text(data.get("url", "")[:40], no_wrap=True, overflow="ellipsis")
-                module = finding.get("module", "")
-                findings_table.add_row(host, description, url, module)
-            # Restore cursor position if possible
-            if old_cursor < findings_table.row_count:
-                findings_table.move_cursor(row=old_cursor)
+            # Re-apply the current filter (this will update filtered_findings)
+            findings_table.filter_by_status(self.findings_status_filter)
         except:
             pass
 
@@ -2528,8 +2948,8 @@ class ScanViewerScreen(Screen):
             table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
             row_index = event.cursor_row
 
-            if row_index < len(table.vulnerabilities):
-                selected_vuln = table.vulnerabilities[row_index]
+            if row_index < len(table.filtered_vulnerabilities):
+                selected_vuln = table.filtered_vulnerabilities[row_index]
                 detail_view = self.query_one("#vulnerability-detail", FindingDetailView)
                 detail_view.finding_json = selected_vuln
 
@@ -2537,8 +2957,8 @@ class ScanViewerScreen(Screen):
             table = self.query_one("#findings-table", FindingsTable)
             row_index = event.cursor_row
 
-            if row_index < len(table.findings):
-                selected_finding = table.findings[row_index]
+            if row_index < len(table.filtered_findings):
+                selected_finding = table.filtered_findings[row_index]
                 detail_view = self.query_one("#finding-detail", FindingDetailView)
                 detail_view.finding_json = selected_finding
 
@@ -2571,6 +2991,14 @@ class ScanViewerScreen(Screen):
             self.tree_type_filter = event.value
             tree = self.query_one("#discovery-tree", DiscoveryTree)
             tree.rebuild_tree(self.tree_type_filter, self.tree_scope_filter)
+        elif event.select.id == "vulnerabilities-status-filter":
+            self.vulnerabilities_status_filter = event.value
+            table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
+            table.filter_by_status(event.value)
+        elif event.select.id == "findings-status-filter":
+            self.findings_status_filter = event.value
+            table = self.query_one("#findings-table", FindingsTable)
+            table.filter_by_status(event.value)
 
     def _match_search_term(self, event: Dict[str, Any], term: str) -> bool:
         """Check if a single search term matches any field in the event"""
@@ -2640,6 +3068,140 @@ class ScanViewerScreen(Screen):
         """Focus the search input"""
         self.query_one("#search-input", Input).focus()
 
+    def action_annotate_selected(self) -> None:
+        """Open annotation dialog for the selected vulnerability/finding"""
+        try:
+            # Get the currently active tab
+            tabbed_content = self.query_one(TabbedContent)
+            active_tab = tabbed_content.active
+
+            event_data = None
+            event_uuid = None
+
+            # Check if we're on Vulnerabilities tab
+            if active_tab == "vulnerabilities":
+                table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
+                row_index = table.cursor_row
+                if row_index < len(table.filtered_vulnerabilities):
+                    event_data = table.filtered_vulnerabilities[row_index]
+                    event_uuid = event_data.get("uuid", "")
+
+            # Check if we're on Findings tab
+            elif active_tab == "findings":
+                table = self.query_one("#findings-table", FindingsTable)
+                row_index = table.cursor_row
+                if row_index < len(table.filtered_findings):
+                    event_data = table.filtered_findings[row_index]
+                    event_uuid = event_data.get("uuid", "")
+
+            # If we found an event to annotate
+            if event_data and event_uuid:
+                current_annotation = self.scan_data.annotation_manager.get_annotation(event_uuid)
+
+                # Show annotation dialog
+                self.app.push_screen(
+                    AnnotationDialog(
+                        event_data,
+                        current_annotation,
+                        lambda annotation_data: self._handle_annotation_save(
+                            event_uuid, annotation_data
+                        )
+                    )
+                )
+            else:
+                self.notify("No item selected or not on Vulnerabilities/Findings tab", severity="warning", timeout=2)
+
+        except Exception as e:
+            self.notify(f"Error opening annotation dialog: {str(e)}", severity="error", timeout=3)
+
+    def _handle_annotation_save(self, event_uuid: str, annotation_data: dict):
+        """Handle saving annotation from dialog"""
+        if annotation_data is None:
+            # User cancelled
+            return
+
+        if not annotation_data:
+            # User clicked Clear - delete annotation
+            self.scan_data.annotation_manager.delete_annotation(event_uuid)
+            self.notify("Annotation cleared", timeout=2)
+        else:
+            # Save annotation
+            self.scan_data.annotation_manager.set_annotation(
+                event_uuid,
+                status=annotation_data.get('status'),
+                priority=annotation_data.get('priority'),
+                note=annotation_data.get('note')
+            )
+            self.notify("Annotation saved", timeout=2)
+
+        # Refresh the UI to show updated status
+        self.refresh_ui_components()
+
+    def _quick_mark_status(self, status: str, status_label: str) -> None:
+        """Quickly mark selected item with a specific status"""
+        try:
+            # Get the currently active tab
+            tabbed_content = self.query_one(TabbedContent)
+            active_tab = tabbed_content.active
+
+            event_data = None
+            event_uuid = None
+            table = None
+
+            # Check if we're on Vulnerabilities tab
+            if active_tab == "vulnerabilities":
+                table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
+                row_index = table.cursor_row
+                if row_index < len(table.filtered_vulnerabilities):
+                    event_data = table.filtered_vulnerabilities[row_index]
+                    event_uuid = event_data.get("uuid", "")
+
+            # Check if we're on Findings tab
+            elif active_tab == "findings":
+                table = self.query_one("#findings-table", FindingsTable)
+                row_index = table.cursor_row
+                if row_index < len(table.filtered_findings):
+                    event_data = table.filtered_findings[row_index]
+                    event_uuid = event_data.get("uuid", "")
+
+            # If we found an event to mark
+            if event_data and event_uuid:
+                # Get current annotation to preserve priority and notes
+                current_annotation = self.scan_data.annotation_manager.get_annotation(event_uuid)
+
+                # Update only the status, preserve other fields
+                self.scan_data.annotation_manager.set_annotation(
+                    event_uuid,
+                    status=status,
+                    priority=current_annotation.get('priority'),
+                    note=current_annotation.get('note')
+                )
+
+                self.notify(f"Marked as {status_label}", timeout=2)
+
+                # Refresh the UI to show updated status
+                self.refresh_ui_components()
+
+                # Re-apply the current filter to remove item from view if needed
+                if active_tab == "vulnerabilities":
+                    table.filter_by_status(self.vulnerabilities_status_filter)
+                elif active_tab == "findings":
+                    table.filter_by_status(self.findings_status_filter)
+
+            else:
+                self.notify("No item selected or not on Vulnerabilities/Findings tab", severity="warning", timeout=2)
+
+        except Exception as e:
+            self.notify(f"Error marking status: {str(e)}", severity="error", timeout=3)
+
+    def action_mark_false_positive(self) -> None:
+        """Quick action to mark selected item as false positive"""
+        self._quick_mark_status("false-positive", "False Positive")
+
+    def action_mark_accepted_risk(self) -> None:
+        """Quick action to mark selected item as accepted risk"""
+        self._quick_mark_status("accepted-risk", "Accepted Risk")
+
     def action_quit_viewer(self) -> None:
         """Return to scan list"""
         self.app.pop_screen()
@@ -2700,6 +3262,41 @@ class BBotViewer(App):
         text-align: center;
     }
 
+    #vulnerabilities-pane {
+        layout: horizontal;
+    }
+
+    #vulnerabilities-container {
+        width: 60%;
+        height: 100%;
+    }
+
+    #vulnerabilities-filter-container {
+        height: auto;
+        padding: 1;
+        background: $panel;
+    }
+
+    #vulnerabilities-status-col {
+        height: auto;
+        width: auto;
+        margin-right: 2;
+    }
+
+    #vulnerabilities-status-filter {
+        width: 30;
+    }
+
+    VulnerabilitiesTable {
+        height: 1fr;
+    }
+
+    #vulnerability-detail-container {
+        width: 40%;
+        height: 100%;
+        border-left: solid $accent;
+    }
+
     #findings-pane {
         layout: horizontal;
     }
@@ -2715,14 +3312,14 @@ class BBotViewer(App):
         background: $panel;
     }
 
-    #findings-severity-col {
+    #findings-status-col {
         height: auto;
         width: auto;
         margin-right: 2;
     }
 
-    #severity-filter {
-        width: 20;
+    #findings-status-filter {
+        width: 30;
     }
 
     #finding-detail-container {
@@ -2912,6 +3509,59 @@ class BBotViewer(App):
     }
 
     #dialog-buttons Button {
+        margin: 0 1;
+    }
+
+    #annotation-dialog {
+        align: center middle;
+        width: 80;
+        height: auto;
+        padding: 2;
+        background: $panel;
+        border: thick $accent;
+    }
+
+    #annotation-title {
+        width: 100%;
+        height: auto;
+        margin-bottom: 1;
+        text-align: center;
+        text-style: bold;
+    }
+
+    #annotation-description {
+        width: 100%;
+        height: auto;
+        margin-bottom: 2;
+        text-align: left;
+        color: $text-muted;
+    }
+
+    #annotation-dialog Label {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        margin-bottom: 0;
+    }
+
+    #annotation-dialog Select {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #annotation-dialog Input {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #annotation-buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        margin-top: 1;
+    }
+
+    #annotation-buttons Button {
         margin: 0 1;
     }
     """

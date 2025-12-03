@@ -11,9 +11,10 @@ A self-contained terminal UI for browsing and analyzing [BBOT](https://www.black
 - 🎯 **Smart Status Detection** - Accurately identifies RUNNING, FINISHED, and INTERRUPTED scans
 - 📋 **Scan Browser** - Navigate multiple scans with separate vulnerability/finding counts and status indicators
 - 📦 **Archive Management** - Compress old scans to save space, restore when needed
+- 📝 **Work Tracking** - Annotate vulnerabilities and findings with status, priority, and notes
 - 🔍 **Separate Views** - Dedicated tabs for vulnerabilities (sorted by severity) and findings
 - 🌳 **Discovery Tree** - Hierarchical view showing parent-child event relationships
-- 📊 **Rich Statistics** - Beautiful tables with event distribution and scope analysis
+- 📊 **Rich Statistics** - Beautiful tables with event distribution, scope analysis, and workflow metrics
 - 🔎 **Event Explorer** - Filter, search, and inspect all scan events
 - ⚙️ **Config Viewer** - View preset.yml configuration
 
@@ -107,6 +108,58 @@ Save disk space by compressing old scans into ZIP archives:
 - Requires confirmation (action is permanent and cannot be undone)
 - All scan data will be lost
 
+## Work Tracking & Annotations
+
+Track your security workflow by annotating vulnerabilities and findings with status, priority, and notes.
+
+**How it works:**
+- Annotations are stored in `.bbot_ui_annotations.json` alongside each scan
+- References events by UUID - never modifies BBOT's original `output.json`
+- Included automatically in archives for backup/restore
+- Survives re-scans of the same target
+
+**Annotating a vulnerability/finding:**
+1. Navigate to the Vulnerabilities or Findings tab
+2. Select an item (arrow keys or j/k)
+3. Press `t` to open annotation dialog
+4. Set status, priority (optional), and notes
+5. Click Save or press Enter
+
+**Quick shortcuts:**
+- Press `x` to mark selected item as **False Positive**
+- Press `i` to mark selected item as **Accepted Risk**
+- These preserve existing priority and notes while updating status
+
+**Status options:**
+- 🆕 **New** - Default status for unannotated items
+- 🔍 **Investigating** - Currently analyzing
+- ✓ **Confirmed** - Verified as real issue
+- ✗ **False Positive** - Not a real vulnerability
+- 📢 **Reported** - Submitted to security team
+- 🔧 **Fixed** - Issue has been resolved
+- ⚠ **Accepted Risk** - Known but accepted
+
+**Priority levels (optional):**
+- 🔴 **Critical** - Requires immediate attention
+- 🟠 **High** - Important, address soon
+- 🟡 **Medium** - Normal priority
+- 🟢 **Low** - Minor issue
+
+**Features:**
+- Status and Priority columns in Vulnerabilities/Findings tables
+- Status filter dropdown - filter by specific status or "Actionable" items (default)
+- Quick keyboard shortcuts (x/i) for rapid triage
+- Workflow status charts in Statistics tab
+- Notes field for detailed context
+- Clear annotation button to reset
+- Annotations persist across sessions and archives
+
+**Status Filtering:**
+- **Actionable** (default) - Shows only items needing attention (new, investigating, confirmed, reported)
+- **All** - Shows all vulnerabilities/findings regardless of status
+- **Specific statuses** - Filter by individual status (false-positive, fixed, etc.)
+- Filter automatically updates when marking items with keyboard shortcuts
+
 ### Scan Viewer Tabs
 
 - **Status Bar**: Shows scan status with real-time event count
@@ -117,13 +170,13 @@ Save disk space by compressing old scans into ZIP archives:
 - **Smart detection**: Automatically stops polling FINISHED and INTERRUPTED scans
 - Press `r` to refresh manually and see notification with new event count
 
-**1. Vulnerabilities** - VULNERABILITY events sorted by severity (CRITICAL→HIGH→MEDIUM→LOW→INFO→UNKNOWN), with host and description (live updates)
-**2. Findings** - FINDING events with host and description (live updates)
+**1. Vulnerabilities** - VULNERABILITY events sorted by severity (CRITICAL→HIGH→MEDIUM→LOW→INFO→UNKNOWN), with status, priority, and annotations (live updates)
+**2. Findings** - FINDING events with status, priority, and annotations (live updates)
 **3. Events** - All events with type filter, scope distance filter, multi-term search, and JSON details (live updates)
 **4. Tree** - Two view modes (live updates):
    - **Discovery**: Shows how events were found through scan modules (parent-child relationships)
    - **Topology**: Logical network hierarchy (IP_RANGE → IP → OPEN_TCP_PORT)
-**5. Statistics** - Event distribution, top 15 modules (ranked), scope distance charts (live updates)
+**5. Statistics** - Event distribution, top 15 modules (ranked), scope distance charts, workflow status, and priority distribution (live updates)
 **6. Configuration** - Syntax-highlighted preset.yml
 
 ## Multi-term Search
@@ -142,7 +195,7 @@ Examples:
 
 ## Keyboard Shortcuts
 
-**Navigation**: `↑/↓` or `j/k` | **View archives**: `Tab` (from scan list) | **Search**: `f` | **Refresh**: `r` | **Archive**: `a` (scan list) | **Unarchive**: `u` (archive list) | **Delete**: `d` | **Adjust split**: `←/→` | **Back/Quit**: `q` or `Escape`
+**Navigation**: `↑/↓` or `j/k` | **Annotate**: `t` | **False Positive**: `x` | **Accepted Risk**: `i` | **View archives**: `Tab` (from scan list) | **Search**: `f` | **Refresh**: `r` | **Archive**: `a` (scan list) | **Unarchive**: `u` (archive list) | **Delete**: `d` | **Adjust split**: `←/→` | **Back/Quit**: `q` or `Escape`
 
 ## Live Refresh & Status Detection
 

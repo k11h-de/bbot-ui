@@ -49,6 +49,7 @@ The application is a **single-file Python script** (`bbot-ui`) with two main sec
 ```
 BBotViewer (App)
 ├── ScanListScreen          # Main screen - browse scans
+│   ├── Progressive loading (instant UI render)
 │   ├── Archive functionality ('a' key)
 │   ├── Delete functionality ('d' key)
 │   └── Switch to archives (Tab key)
@@ -59,10 +60,11 @@ BBotViewer (App)
 │   └── Return to scans (Tab/q/Escape)
 │
 ├── ScanViewerScreen        # Individual scan viewer
-│   ├── VulnerabilitiesTable
-│   ├── FindingsTable
+│   ├── VulnerabilitiesTable (with annotations)
+│   ├── FindingsTable (with annotations)
 │   ├── EventsTable
 │   ├── DiscoveryTree
+│   ├── SubdomainsTree (conditional)
 │   ├── StatisticsView
 │   └── PresetView
 │
@@ -101,10 +103,11 @@ Parses and manages BBOT scan data from output.json files.
 - `_load_events()` - Incremental loading for large files
 - `get_scan_status()` - Determines RUNNING/FINISHED/INTERRUPTED
 
-#### `ScanListScreen` (Lines ~1276-1896)
+#### `ScanListScreen` (Lines ~1726-2400)
 Main screen showing all scans in a table.
 
 **Key Features:**
+- **Progressive loading** - Instant UI render (<200ms), scans appear one-by-one
 - Auto-refresh every 3 seconds (configurable)
 - Status detection using psutil (checks if output.json is open)
 - Archive functionality ('a' key)
@@ -112,15 +115,26 @@ Main screen showing all scans in a table.
 - Switch to archives (Tab key)
 - **Important:** `on_screen_resume()` refreshes when returning from archives
 
+**Progressive Loading Flow:**
+1. `on_mount()` - Renders empty UI immediately with "Scanning..." message
+2. `start_progressive_load()` - Creates iterator for directory listing
+3. `list_next_directory()` - Lists one directory per timer tick (1ms intervals)
+4. `load_next_scan()` - Loads each scan individually with UI updates (10ms intervals)
+5. `check_running_scans_status()` - Verifies UNKNOWN scans after all loaded
+
 **Status Detection Chain:**
 1. Read last SCAN event from output.json
-2. If status="RUNNING", check if process has file open (psutil)
-3. Result: RUNNING (file open) | INTERRUPTED (not open) | FINISHED
+2. If status="RUNNING", mark as UNKNOWN (deferred check)
+3. After all scans loaded, check if process has file open (psutil)
+4. Result: RUNNING (file open) | INTERRUPTED (not open) | FINISHED
 
 **Performance Optimizations:**
+- Progressive directory iteration (non-blocking)
+- One scan loaded per timer tick
 - Caches process checks for 5 seconds
-- Only checks RUNNING scans
+- Only checks RUNNING scans during refresh
 - Estimates event counts for large files (>1MB)
+- `initial_load_phase` flag prevents auto-refresh during loading
 
 #### `ArchivesListScreen` (Lines ~1898-2122)
 Browse archived scans (ZIP files).
@@ -132,21 +146,37 @@ Browse archived scans (ZIP files).
 - Delete functionality ('d' key)
 - Return to scans (Tab/q/Escape)
 
-#### `ScanViewerScreen` (Lines ~2015-2647)
+#### `ScanViewerScreen` (Lines ~2700-3200)
 Detailed view of a single scan with tabs.
 
 **Tabs:**
-1. **Vulnerabilities** - VULNERABILITY events, sorted by severity
-2. **Findings** - FINDING events
+1. **Vulnerabilities** - VULNERABILITY events, sorted by severity (with annotations)
+2. **Findings** - FINDING events (with annotations)
 3. **Events** - All events with filters and search
 4. **Tree** - Discovery (parent-child) or Topology view
 5. **Statistics** - Event distribution and module rankings
-6. **Configuration** - preset.yml syntax highlighted
+6. **Subdomains** - Hierarchical tree (conditional, only if `subdomains.txt` exists)
+7. **Configuration** - preset.yml syntax highlighted
+
+**Conditional Bindings:**
+- Annotation shortcuts (t, x, i) only visible on Vulnerabilities and Findings tabs
+- Implemented via `check_action()` method
+- Footer updates when tab changes via `on_tabbed_content_tab_activated()`
 
 **Live Refresh:**
 - Auto-updates every 2 seconds when scan is RUNNING
 - Stops polling for FINISHED/INTERRUPTED scans
 - Preserves cursor position during updates
+
+#### `SubdomainsTree` (Lines ~1638-1722)
+Hierarchical tree widget showing subdomain structure.
+
+**Key Features:**
+- Only displayed when `subdomains.txt` exists in scan folder
+- Groups subdomains by root domain (e.g., example.com)
+- Builds hierarchy: root → intermediate → leaf subdomains
+- Auto-expands all nodes for easy navigation
+- Handles complex subdomain structures (e.g., api.dev.example.com)
 
 #### `ConfirmDialog` (Lines ~2124-2150)
 Modal confirmation for destructive operations.
@@ -161,9 +191,56 @@ self.app.push_screen(
 )
 ```
 
-## Recent Changes (December 2, 2025)
+## Recent Changes
 
-### Archive Management System
+### December 3, 2025 - Performance & Features Update
+
+#### Progressive Loading System
+**Problem:** Black screen for 3-6 seconds on startup when scanning network filesystems with many directories.
+
+**Root Cause:** `sorted(self.scans_dir.iterdir())` was blocking the UI thread for several seconds.
+
+**Solution - Truly Progressive Loading:**
+- `start_progressive_load()` - Creates iterator for non-blocking directory listing
+- `list_next_directory()` - Processes one directory per 1ms timer tick
+- `load_next_scan()` - Loads one scan per 10ms timer tick with UI updates
+- `check_running_scans_status()` - Deferred status verification after all scans loaded
+
+**Results:**
+- UI renders in <200ms (was 3-6 seconds)
+- Scans appear progressively with live status updates
+- No black screen, instant feedback to user
+
+#### Subdomain Tree View
+**Added:**
+- `SubdomainsTree` widget for hierarchical subdomain display
+- Conditional tab in `ScanViewerScreen` (only shown when `subdomains.txt` exists)
+- `ScanData.load_subdomains()` method to parse subdomain files
+- Hierarchical tree building with proper parent-child relationships
+- Auto-expand all nodes for easy navigation
+
+**Use case:** Works with BBOT's `subdomain-enum` preset
+
+#### Conditional Keyboard Shortcuts
+**Added:**
+- `check_action()` method in `ScanViewerScreen`
+- Annotation shortcuts (t, x, i) only visible on Vulnerabilities/Findings tabs
+- `on_tabbed_content_tab_activated()` handler to refresh bindings on tab change
+- Cleaner footer display without irrelevant shortcuts
+
+#### Code Cleanup
+**Removed dead code:**
+- `quick` parameter in `discover_scans()` method (never used)
+- "LOADING" status handling (replaced by "UNKNOWN" during progressive load)
+- "ERROR" status handling (exception handler uses silent skip)
+
+**Key variables added:**
+- `initial_load_phase` - Prevents auto-refresh during initial loading
+- `scan_dirs_to_load` - Queue for progressive loading
+- `scan_dirs_iterator` - Iterator for directory listing
+
+### December 2, 2025 - Archive Management System
+
 **Added:**
 - Archive scans to ZIP format (compress and delete original)
 - Unarchive scans (extract and delete ZIP)
@@ -178,21 +255,11 @@ self.app.push_screen(
 - Confirmation dialogs for all destructive operations
 - Atomic operations with rollback on failure
 
-### UI Flow Changes
+**UI Flow Changes:**
 - **Old:** Single scan list screen
 - **New:** Two screens with Tab navigation
   - ScanListScreen ⟷ ArchivesListScreen (Tab key toggles)
   - Press 'q' from archive list also returns to scans
-
-### Code Cleanup
-**Removed:**
-- Severity filter functionality (--min-severity CLI option and UI filter)
-- Failed MainScreen with embedded widgets approach (ScanListWidget, ArchivesListWidget)
-- Unused CSS rules: `#scan-list-filter-container`, `#scan-list-severity-col`, `#scan-list-severity-filter`
-
-**Still in use:**
-- `TabbedContent` and `TabPane` - for ScanViewerScreen's 6 internal tabs
-- `Select` widget - for event type filter in Events tab
 
 ## Important Implementation Patterns
 
@@ -429,5 +496,5 @@ git commit -m "docs: update README"
 
 ---
 
-*Last Updated: December 2, 2025*
-*Version: 1.0 with Archive Management*
+*Last Updated: December 3, 2025*
+*Version: 1.1 with Progressive Loading & Subdomain Tree*

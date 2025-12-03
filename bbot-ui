@@ -487,12 +487,15 @@ class ScanData:
         self.events: List[Dict[str, Any]] = []
         self.scan_info: Dict[str, Any] = {}
         self.preset_content: str = ""
+        self.subdomains: List[str] = []
+        self.has_subdomains: bool = False
         self.file_position: int = 0  # Track position in output.json for incremental reads
         self.file_handler_cache = None  # Cache for file handler check: (result, timestamp)
         self.cache_ttl = 5.0  # Cache results for 5 seconds
         self.annotation_manager = AnnotationManager(scan_path)  # Annotation system
         self.load_events()
         self.load_preset()
+        self.load_subdomains()
 
     def load_events(self):
         """Load events from output.json"""
@@ -666,6 +669,21 @@ class ScanData:
                 self.preset_content = f"Error loading preset: {e}"
         else:
             self.preset_content = "No preset.yml found in scan directory"
+
+    def load_subdomains(self):
+        """Load subdomains from subdomains.txt if present"""
+        subdomains_file = self.scan_path / "subdomains.txt"
+        if subdomains_file.exists():
+            try:
+                with open(subdomains_file, 'r') as f:
+                    self.subdomains = [line.strip() for line in f if line.strip()]
+                self.has_subdomains = len(self.subdomains) > 0
+            except Exception as e:
+                self.subdomains = []
+                self.has_subdomains = False
+        else:
+            self.subdomains = []
+            self.has_subdomains = False
 
     def get_statistics(self) -> Dict[str, Any]:
         """Calculate statistics from events"""
@@ -1620,6 +1638,90 @@ class TreeDetailView(VerticalScroll):
         self.mount(Static(syntax))
 
 
+class SubdomainsTree(Tree):
+    """Tree widget showing subdomain hierarchy from subdomains.txt"""
+
+    def __init__(self, scan_data: ScanData, **kwargs):
+        super().__init__("Subdomains", **kwargs)
+        self.scan_data = scan_data
+
+    def on_mount(self) -> None:
+        """Build the tree when mounted"""
+        self.build_tree()
+
+    def build_tree(self) -> None:
+        """Build subdomain tree from domain hierarchy"""
+        if not self.scan_data.subdomains:
+            self.root.add("No subdomains found")
+            return
+
+        # Group subdomains by root domain (e.g., example.com)
+        root_domains = {}
+
+        for subdomain in self.scan_data.subdomains:
+            parts = subdomain.split('.')
+
+            # Get root domain (last two parts: domain.tld)
+            if len(parts) >= 2:
+                root_domain = '.'.join(parts[-2:])
+
+                if root_domain not in root_domains:
+                    root_domains[root_domain] = []
+                root_domains[root_domain].append(subdomain)
+
+        # Build tree for each root domain
+        for root_domain in sorted(root_domains.keys()):
+            subdomains = root_domains[root_domain]
+
+            # Create root domain node
+            root_node = self.root.add(root_domain)
+
+            # Add subdomains under root
+            for subdomain in sorted(subdomains):
+                if subdomain != root_domain:
+                    # Build hierarchy for this subdomain
+                    self._add_subdomain_hierarchy(root_node, subdomain, root_domain)
+
+            root_node.expand()
+
+        # Expand root by default
+        self.root.expand()
+
+    def _add_subdomain_hierarchy(self, parent_node: TreeNode, subdomain: str, root_domain: str) -> None:
+        """Add subdomain with proper hierarchy under root domain"""
+        # Get the parts that are not in root_domain
+        # e.g., "api.dev.example.com" with root "example.com" -> ["api", "dev"]
+        subdomain_parts = subdomain.split('.')
+        root_parts = root_domain.split('.')
+
+        # Get only the subdomain prefix parts
+        if len(subdomain_parts) > len(root_parts):
+            prefix_parts = subdomain_parts[:len(subdomain_parts) - len(root_parts)]
+
+            # Build hierarchy from right to left (closest to root first)
+            # e.g., ["api", "dev"] -> first add "dev.example.com", then "api.dev.example.com"
+            current_node = parent_node
+            built_parts = list(root_parts)  # Start with root domain parts
+
+            for i in range(len(prefix_parts) - 1, -1, -1):
+                built_parts.insert(0, prefix_parts[i])
+                full_domain = '.'.join(built_parts)
+
+                # Check if this intermediate domain exists as a node already
+                # If not, create it
+                existing_node = None
+                for child in current_node.children:
+                    if child.label == full_domain:
+                        existing_node = child
+                        break
+
+                if existing_node:
+                    current_node = existing_node
+                else:
+                    current_node = current_node.add(full_domain)
+                    current_node.expand()
+
+
 class ScanListScreen(Screen):
     """Screen to select a scan from a list"""
 
@@ -1636,12 +1738,17 @@ class ScanListScreen(Screen):
         super().__init__()
         self.scans_dir = scans_dir
         self.refresh_interval = refresh_interval
-        self.scans = self.discover_scans(initial_load=True)
+        # Start with empty list - will be populated after mount
+        self.scans = []
         self.refresh_timer = None
         self.scan_statuses = {}  # Track scan status for each scan
         self.scan_event_counts = {}  # Cache event/vuln/finding counts for FINISHED/INTERRUPTED scans: {scan_name: (events, vulns, findings)}
+        self.loading_complete = False  # Track if initial load is done
+        self.initial_load_phase = True  # True during initial load + status check phase
         self.file_handler_cache = {}  # Cache file handler check results: {path: (result, timestamp)}
         self.cache_ttl = 5.0  # Cache results for 5 seconds
+        self.scan_dirs_to_load = []  # Queue of scan directories to load
+        self.scan_dirs_iterator = None  # Iterator for progressive directory listing
 
     def _check_file_open_psutil(self, file_path: Path) -> bool:
         """
@@ -1967,17 +2074,9 @@ class ScanListScreen(Screen):
         """Create the scan list UI"""
         yield Header()
 
-        # Calculate totals
-        total_vulns = sum(scan["vuln_count"] for scan in self.scans)
-        total_findings = sum(scan["finding_count"] for scan in self.scans)
-
-        issues_text = ""
-        if total_vulns > 0 or total_findings > 0:
-            issues_text = f" ({total_vulns} vulns, {total_findings} findings)"
-
         with Vertical():
             yield Static(
-                f"# Select a Scan\n\nFound {len(self.scans)} scans{issues_text} in {self.scans_dir}\n\nPress Tab to view archives\n",
+                f"# Select a Scan\n\nScanning {self.scans_dir}...\n\nPress Tab to view archives\n",
                 id="header"
             )
             yield DataTable(id="scan-table")
@@ -1990,14 +2089,182 @@ class ScanListScreen(Screen):
         table.cursor_type = "row"
         table.add_columns("Scan Name", "Status", "Events", "Vulns", "Findings", "Last Modified")
 
-        self.refresh_table()
+        # Start with empty table - renders immediately
+        header = self.query_one("#header", Static)
+        header.update(f"# Select a Scan\n\nScanning {self.scans_dir}...\n\nPress Tab to view archives\n")
 
-        # Start auto-refresh timer
+        # Start progressive loading after UI is visible
+        # Use longer delay to ensure UI renders first
+        self.set_timer(0.2, self.start_progressive_load)
+
+        # Start auto-refresh timer (will start working after initial load completes)
         self.refresh_timer = self.set_interval(self.refresh_interval, self.check_for_scan_updates)
 
-        # Trigger immediate status check for UNKNOWN scans (those with RUNNING status at startup)
-        # This updates them quickly without blocking startup
-        self.set_timer(0.5, self.check_for_scan_updates)
+    def start_progressive_load(self) -> None:
+        """Start progressive directory listing"""
+        # Create iterator for directory listing (non-blocking)
+        try:
+            self.scan_dirs_iterator = iter(self.scans_dir.iterdir())
+        except Exception:
+            self.loading_complete = True
+            self.initial_load_phase = False
+            return
+
+        # Start listing directories one at a time
+        self.set_timer(0.001, self.list_next_directory)
+
+    def list_next_directory(self) -> None:
+        """List one directory from the iterator"""
+        try:
+            # Get next directory
+            scan_dir = next(self.scan_dirs_iterator)
+
+            # Skip hidden directories
+            if not scan_dir.name.startswith('.'):
+                self.scan_dirs_to_load.append(scan_dir)
+
+            # Schedule next directory
+            self.set_timer(0.001, self.list_next_directory)
+
+        except StopIteration:
+            # Done listing directories
+            # Sort the list in memory (fast)
+            self.scan_dirs_to_load.sort(key=lambda p: p.name)
+
+            # Start loading scans one by one
+            # Don't update header yet - count includes non-scan files
+            if self.scan_dirs_to_load:
+                self.set_timer(0.01, self.load_next_scan)
+            else:
+                self.loading_complete = True
+                self.initial_load_phase = False
+                header = self.query_one("#header", Static)
+                header.update(f"# Select a Scan\n\nNo scans found in {self.scans_dir}\n\nPress Tab to view archives\n")
+        except Exception:
+            # Error listing directories
+            self.loading_complete = True
+            self.initial_load_phase = False
+
+    def load_next_scan(self) -> None:
+        """Load the next scan in the queue"""
+        if not self.scan_dirs_to_load:
+            # All scans loaded - mark complete and check for RUNNING status
+            self.loading_complete = True
+            self.set_timer(0.5, self.check_running_scans_status)
+
+            # Update header with final counts
+            total_vulns = sum(scan["vuln_count"] for scan in self.scans)
+            total_findings = sum(scan["finding_count"] for scan in self.scans)
+            issues_text = ""
+            if total_vulns > 0 or total_findings > 0:
+                issues_text = f" ({total_vulns} vulns, {total_findings} findings)"
+            header = self.query_one("#header", Static)
+            header.update(f"# Select a Scan\n\nFound {len(self.scans)} scans{issues_text} in {self.scans_dir}\n\nPress Tab to view archives\n")
+            return
+
+        # Get next scan to load
+        scan_dir = self.scan_dirs_to_load.pop(0)
+
+        # Skip if not a directory or no output.json
+        if not scan_dir.is_dir():
+            self.set_timer(0.01, self.load_next_scan)
+            return
+
+        output_json = scan_dir / "output.json"
+        if not output_json.exists():
+            self.set_timer(0.01, self.load_next_scan)
+            return
+
+        try:
+            # Get SCAN event (thorough mode for accuracy)
+            scan_event = self._get_last_scan_event(output_json, thorough=True)
+
+            # Extract scan status
+            scan_status = "UNKNOWN"
+            if scan_event:
+                scan_status = scan_event.get("data", {}).get("status", "UNKNOWN")
+
+            # Get event counts (thorough mode)
+            event_count, vuln_count, finding_count = self._estimate_event_counts(output_json, thorough=True)
+            self.scan_event_counts[scan_dir.name] = (event_count, vuln_count, finding_count)
+
+            # Check if RUNNING (defer to avoid blocking)
+            if scan_status == "RUNNING":
+                # Mark as UNKNOWN, will be checked later
+                scan_status = "UNKNOWN"
+
+            # Get last modified time
+            stat = output_json.stat()
+            modified_time = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+
+            # Track status
+            self.scan_statuses[scan_dir.name] = scan_status
+
+            # Add to scans list
+            self.scans.append({
+                "name": scan_dir.name,
+                "path": scan_dir,
+                "event_count": event_count,
+                "vuln_count": vuln_count,
+                "finding_count": finding_count,
+                "modified": modified_time,
+                "status": scan_status,
+                "is_running": scan_status == "RUNNING",
+            })
+
+            # Update header after first scan to show count
+            if len(self.scans) == 1:
+                header = self.query_one("#header", Static)
+                header.update(f"# Select a Scan\n\nLoading scans from {self.scans_dir}...\n\nPress Tab to view archives\n")
+
+            # Update UI
+            self.refresh_table()
+
+        except Exception:
+            pass
+
+        # Schedule next scan load
+        self.set_timer(0.01, self.load_next_scan)
+
+    def check_running_scans_status(self) -> None:
+        """Check UNKNOWN scans to determine if they are actually RUNNING or INTERRUPTED"""
+        # First pass: mark all UNKNOWN as CHECKING
+        for scan in self.scans:
+            if scan["status"] == "UNKNOWN":
+                scan["status"] = "CHECKING..."
+
+        self.refresh_table()
+
+        # Second pass: actually check each one
+        for scan in self.scans:
+            if scan["status"] == "CHECKING...":
+                output_json = scan["path"] / "output.json"
+
+                try:
+                    scan_event = self._get_last_scan_event(output_json, thorough=False)
+                    if scan_event:
+                        status = scan_event.get("data", {}).get("status", "UNKNOWN")
+                        if status == "RUNNING":
+                            # Check if actually running
+                            if self._check_active_file_handler(output_json):
+                                scan["status"] = "RUNNING"
+                                scan["is_running"] = True
+                            else:
+                                scan["status"] = "INTERRUPTED"
+                                scan["is_running"] = False
+                        else:
+                            scan["status"] = status
+                            scan["is_running"] = False
+
+                        self.scan_statuses[scan["name"]] = scan["status"]
+                except Exception:
+                    scan["status"] = "UNKNOWN"
+                    scan["is_running"] = False
+
+        self.refresh_table()
+
+        # Initial load phase is now complete
+        self.initial_load_phase = False
 
     def on_unmount(self) -> None:
         """Clean up timer when screen is removed"""
@@ -2006,6 +2273,10 @@ class ScanListScreen(Screen):
 
     def on_screen_resume(self) -> None:
         """Called when returning to this screen from another screen"""
+        # Only refresh if initial load is complete (prevents running on first mount)
+        if not self.loading_complete:
+            return
+
         # Refresh the scan list when returning from archives
         self.scans = self.discover_scans(initial_load=False)
         self.refresh_table()
@@ -2059,6 +2330,10 @@ class ScanListScreen(Screen):
 
     def check_for_scan_updates(self) -> None:
         """Check if any scans have status changes, new scans added, or RUNNING scans with new events"""
+        # Skip updates during initial loading AND status checking phase
+        if not self.loading_complete or self.initial_load_phase:
+            return
+
         has_changes = False
         has_running_scans = False
 
@@ -2756,6 +3031,11 @@ class ScanViewerScreen(Screen):
             with TabPane("Statistics", id="stats-tab"):
                 yield StatisticsView(self.scan_data)
 
+            # Conditionally add Subdomains tab if subdomains.txt exists
+            if self.scan_data.has_subdomains:
+                with TabPane(f"Subdomains ({len(self.scan_data.subdomains)})", id="subdomains-tab"):
+                    yield SubdomainsTree(self.scan_data, id="subdomains-tree")
+
             with TabPane("Scan Preset", id="config-tab"):
                 # Create syntax highlighted content directly
                 if self.scan_data.preset_content:
@@ -2771,6 +3051,24 @@ class ScanViewerScreen(Screen):
                     yield Static("No preset configuration available")
 
         yield Footer()
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Check if an action should be available based on current context"""
+        # Annotation actions only available on vulnerabilities and findings tabs
+        if action in ("annotate_selected", "mark_false_positive", "mark_accepted_risk"):
+            try:
+                tabbed_content = self.query_one(TabbedContent)
+                active_tab = tabbed_content.active
+                # Only show annotation bindings on vulnerabilities and findings tabs
+                return active_tab in ("vulnerabilities", "findings")
+            except:
+                return False
+        return True
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Handle tab changes to refresh bindings in footer"""
+        # Refresh bindings display when tab changes
+        self.refresh_bindings()
 
     def on_mount(self) -> None:
         """Set up periodic refresh check"""

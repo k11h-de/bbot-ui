@@ -14,6 +14,7 @@ A self-contained terminal UI for browsing and analyzing [BBOT](https://www.black
 - 📝 **Work Tracking** - Annotate vulnerabilities and findings with status, priority, and notes
 - 🔍 **Separate Views** - Dedicated tabs for vulnerabilities (sorted by severity) and findings
 - 🌳 **Discovery Tree** - Hierarchical view showing parent-child event relationships
+- 🌐 **Subdomain Tree** - Hierarchical view of discovered subdomains (when available)
 - 📊 **Rich Statistics** - Beautiful tables with event distribution, scope analysis, and workflow metrics
 - 🔎 **Event Explorer** - Filter, search, and inspect all scan events
 - ⚙️ **Config Viewer** - View preset.yml configuration
@@ -55,16 +56,17 @@ Settings are automatically saved to `~/.bbot_ui_config.json` and used as default
 ## Interface
 
 ### Scan List
+- **Instant startup** - UI appears in <200ms, scans load progressively
 - Browse all scans in a table with columns: Scan Name, Status, Events, Vulns, Findings, Last Modified
 - Header shows total scans, vulnerability/finding counts, and running scan count
 - **Status column** shows real-time scan state:
   - **● RUNNING** (green) - Scan actively running with bbot process detected
   - **⚠ INTERRUPTED** (yellow) - Scan was stopped/interrupted (no active process)
   - **✓ FINISHED** (blue) - Scan completed successfully
-  - **○ CHECKING...** (dim) - Status being verified (appears briefly at startup)
+  - **○ CHECKING...** (dim) - Status being verified (appears during progressive load)
 - Vulns and Findings columns show **⚠** indicator for scans with vulnerabilities/findings
+- Scans appear one-by-one with live status updates during initial load
 - Auto-refreshes every 3 seconds to show new scans and status changes
-- Status verified within 0.5 seconds of startup (no false "RUNNING" status)
 - `↑/↓` or `j/k` to navigate, `Enter` to open, `r` to refresh manually, `a` to archive, `d` to delete
 - Press `Tab` to view archived scans
 
@@ -177,7 +179,8 @@ Track your security workflow by annotating vulnerabilities and findings with sta
    - **Discovery**: Shows how events were found through scan modules (parent-child relationships)
    - **Topology**: Logical network hierarchy (IP_RANGE → IP → OPEN_TCP_PORT)
 **5. Statistics** - Event distribution, top 15 modules (ranked), scope distance charts, workflow status, and priority distribution (live updates)
-**6. Configuration** - Syntax-highlighted preset.yml
+**6. Subdomains** - Hierarchical tree view of discovered subdomains (only shown when `subdomains.txt` exists, typically from subdomain-enum preset)
+**7. Configuration** - Syntax-highlighted preset.yml
 
 ## Multi-term Search
 
@@ -193,9 +196,29 @@ Examples:
 - `k11h HIGH` - Events related to k11h.de with HIGH severity
 - `nuclei VULNERABILITY` - Vulnerabilities discovered by nuclei module
 
+## Subdomains Tree View
+
+When running BBOT with the `subdomain-enum` preset (or any scan that generates `subdomains.txt`), a **Subdomains** tab automatically appears in the scan viewer showing a hierarchical tree of discovered subdomains.
+
+**Features:**
+- **Hierarchical display**: Subdomains organized by domain structure (e.g., `api.example.com` under `example.com`)
+- **Expandable tree**: Navigate through domain levels with intuitive tree navigation
+- **Count indicator**: Tab label shows total subdomain count (e.g., "Subdomains (42)")
+- **Automatic detection**: Tab only appears when `subdomains.txt` exists in scan folder
+
+**Example hierarchy:**
+```
+example.com
+  ├─ api.example.com
+  ├─ dev.example.com
+  └─ www.example.com
+```
+
 ## Keyboard Shortcuts
 
-**Navigation**: `↑/↓` or `j/k` | **Annotate**: `t` | **False Positive**: `x` | **Accepted Risk**: `i` | **View archives**: `Tab` (from scan list) | **Search**: `f` | **Refresh**: `r` | **Archive**: `a` (scan list) | **Unarchive**: `u` (archive list) | **Delete**: `d` | **Adjust split**: `←/→` | **Back/Quit**: `q` or `Escape`
+**Navigation**: `↑/↓` or `j/k` | **Annotate**: `t` (Vulns/Findings only) | **False Positive**: `x` (Vulns/Findings only) | **Accepted Risk**: `i` (Vulns/Findings only) | **View archives**: `Tab` (from scan list) | **Search**: `f` | **Refresh**: `r` | **Archive**: `a` (scan list) | **Unarchive**: `u` (archive list) | **Delete**: `d` | **Adjust split**: `←/→` | **Back/Quit**: `q` or `Escape`
+
+**Note:** Annotation shortcuts (t, x, i) only appear in the footer when viewing Vulnerabilities or Findings tabs.
 
 ## Live Refresh & Status Detection
 
@@ -218,8 +241,11 @@ The UI uses a **multi-method detection chain** to accurately determine scan stat
    - **FINISHED**: SCAN event says FINISHED (has completion data)
 
 ### Features
+- **Progressive loading**: Scans appear one-by-one with live status updates during startup
 - **Accurate detection**: Immediately identifies interrupted scans without waiting for timeout
 - **Performance optimized**:
+  - Progressive directory iteration (non-blocking, 1ms per directory)
+  - One scan loaded per 10ms timer tick
   - Caches process checks for 5 seconds (avoids scanning all processes repeatedly)
   - Only checks RUNNING scans (skips expensive checks for FINISHED scans)
   - Smart polling stops checking FINISHED and INTERRUPTED scans
@@ -283,14 +309,20 @@ brew install python3
 
 ## Performance
 
-The UI is optimized for large scans:
+The UI is optimized for large scans and many directories:
+
+**Startup Performance:**
+- **Progressive loading** - UI renders instantly (<200ms), scans load one-by-one
+- Directory listing happens incrementally (1ms per directory)
+- Works efficiently on network filesystems and remote mounts
+- No blocking operations during startup
 
 **Display Limits:**
 - **Vulnerabilities tab**: 1000 rows max (sorted by severity)
 - **Findings tab**: 1000 rows max
 - **Events tab**: 1000 rows max (use filters for large scans)
 - **Tree views**: 500 nodes max (use filters to focus on specific areas)
-- **Scan list**: Fast loading using sampling for large scans (>1MB)
+- **Scan list**: Progressive loading shows scans as they're discovered
 
 **File Reading:**
 - Reads from both ends of file to find SCAN events (handles reused scan directories)
@@ -302,11 +334,15 @@ The UI is optimized for large scans:
 - Timer automatically stops for FINISHED/INTERRUPTED scans
 - Only checks RUNNING scans for updates
 - Results cached for 5 seconds
+- `initial_load_phase` flag prevents refresh conflicts during startup
 
 ## Tips
 
 - Use filters (type, scope distance) to focus on specific events in large scans
 - Event counts for large scans (>1MB) are estimates for performance
+- Annotation shortcuts (t, x, i) are context-sensitive and only appear on relevant tabs
+- Progressive loading means you can start working immediately - no need to wait for all scans to load
+- On slow network filesystems, scans will populate gradually - this is normal behavior
 - Delete `~/.bbot_ui_venv/` to force clean reinstall
 
 ## License

@@ -1727,7 +1727,9 @@ class SubdomainsTree(Tree):
                 # If not, create it
                 existing_node = None
                 for child in current_node.children:
-                    if child.label == full_domain:
+                    # Convert label to string for comparison (might be Rich Text object)
+                    child_label = str(child.label) if hasattr(child.label, '__str__') else child.label
+                    if child_label == full_domain:
                         existing_node = child
                         break
 
@@ -3262,28 +3264,40 @@ class ScanViewerScreen(Screen):
             table = self.query_one("#vulnerabilities-table", VulnerabilitiesTable)
             row_index = event.cursor_row
 
-            if row_index < len(table.filtered_vulnerabilities):
+            if row_index >= 0 and row_index < len(table.filtered_vulnerabilities):
                 selected_vuln = table.filtered_vulnerabilities[row_index]
                 detail_view = self.query_one("#vulnerability-detail", FindingDetailView)
                 detail_view.finding_json = selected_vuln
+            elif row_index < 0:
+                # No row selected (empty table or cursor_row is -1)
+                detail_view = self.query_one("#vulnerability-detail", FindingDetailView)
+                detail_view.finding_json = {}
 
         elif event.data_table.id == "findings-table":
             table = self.query_one("#findings-table", FindingsTable)
             row_index = event.cursor_row
 
-            if row_index < len(table.filtered_findings):
+            if row_index >= 0 and row_index < len(table.filtered_findings):
                 selected_finding = table.filtered_findings[row_index]
                 detail_view = self.query_one("#finding-detail", FindingDetailView)
                 detail_view.finding_json = selected_finding
+            elif row_index < 0:
+                # No row selected (empty table or cursor_row is -1)
+                detail_view = self.query_one("#finding-detail", FindingDetailView)
+                detail_view.finding_json = {}
 
         elif event.data_table.id == "event-table":
             table = self.query_one("#event-table", EventTable)
             row_index = event.cursor_row
 
-            if row_index < len(table.filtered_events):
+            if row_index >= 0 and row_index < len(table.filtered_events):
                 selected_event = table.filtered_events[row_index]
                 detail_view = self.query_one("#event-detail", EventDetailView)
                 detail_view.event_json = selected_event
+            elif row_index < 0:
+                # No row selected (empty table or cursor_row is -1)
+                detail_view = self.query_one("#event-detail", EventDetailView)
+                detail_view.event_json = {}
 
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
         """Handle tree node highlight (navigation)"""

@@ -493,22 +493,30 @@ class ScanData:
         self.file_handler_cache = None  # Cache for file handler check: (result, timestamp)
         self.cache_ttl = 5.0  # Cache results for 5 seconds
         self.annotation_manager = AnnotationManager(scan_path)  # Annotation system
+        self.bbot_version = "unknown"  # BBOT version detection: "2.x", "3.0", or "unknown"
         self.load_events()
         self.load_preset()
         self.load_subdomains()
 
     def load_events(self):
-        """Load events from output.json"""
+        """Load events from output.json and detect BBOT version"""
         json_file = self.scan_path / "output.json"
         if not json_file.exists():
             return
 
         with open(json_file, "r") as f:
+            first_event = True
             for line in f:
                 line = line.strip()
                 if line:
                     try:
                         event = json.loads(line)
+
+                        # Detect version from first event
+                        if first_event:
+                            self.bbot_version = self._detect_version(event)
+                            first_event = False
+
                         if event.get("type") == "SCAN":
                             # Keep the LAST SCAN event (overwrite previous ones)
                             self.scan_info = event
@@ -580,7 +588,8 @@ class ScanData:
         Get the current scan status.
         Returns: "RUNNING", "FINISHED", "INTERRUPTED", or "UNKNOWN"
         """
-        status = self.scan_info.get("data", {}).get("status", "UNKNOWN")
+        scan_data = self._get_scan_data(self.scan_info)
+        status = scan_data.get("status", "UNKNOWN")
 
         # Only check for active processes if status is RUNNING
         # Skip expensive checks for FINISHED scans
@@ -685,6 +694,70 @@ class ScanData:
             self.subdomains = []
             self.has_subdomains = False
 
+    def _detect_version(self, event: Dict[str, Any]) -> str:
+        """Detect BBOT version from event timestamp format"""
+        timestamp = event.get("timestamp")
+
+        if timestamp is None:
+            return "unknown"
+
+        if isinstance(timestamp, (int, float)):
+            return "3.0"
+        elif isinstance(timestamp, str) and "T" in timestamp:
+            return "2.x"
+        else:
+            return "unknown"
+
+    def _parse_timestamp(self, timestamp):
+        """Parse timestamp based on BBOT version"""
+        from datetime import datetime
+
+        if self.bbot_version == "3.0":
+            # Unix epoch float
+            try:
+                return datetime.fromtimestamp(timestamp)
+            except:
+                return datetime.now()
+        elif self.bbot_version == "2.x":
+            # ISO 8601 string
+            try:
+                ts_str = str(timestamp).replace("+00:00", "")
+                return datetime.fromisoformat(ts_str)
+            except:
+                return datetime.now()
+        else:
+            # Fallback: Try both methods
+            try:
+                if isinstance(timestamp, (int, float)):
+                    return datetime.fromtimestamp(timestamp)
+                else:
+                    ts_str = str(timestamp).replace("+00:00", "")
+                    return datetime.fromisoformat(ts_str)
+            except:
+                return datetime.now()
+
+    def _get_event_data(self, event: Dict[str, Any]) -> Any:
+        """Extract event data based on BBOT version (works for all event types)
+
+        Returns the data value which can be:
+        - A dict (for complex events like VULNERABILITY, FINDING, SCAN)
+        - A string or other simple value (for simple events like DNS_NAME, URL, OPEN_TCP_PORT)
+        """
+        if self.bbot_version == "3.0":
+            # BBOT 3.0: Try data_json first (for VULNERABILITY, FINDING, SCAN)
+            # Fall back to data (for simple events like DNS_NAME, URL, OPEN_TCP_PORT)
+            if "data_json" in event:
+                return event.get("data_json", {})
+            else:
+                return event.get("data", {})
+        else:
+            # BBOT 2.x: Always use data
+            return event.get("data", {})
+
+    def _get_scan_data(self, scan_event: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract scan data based on BBOT version (alias for _get_event_data for backward compatibility)"""
+        return self._get_event_data(scan_event)
+
     def get_statistics(self) -> Dict[str, Any]:
         """Calculate statistics from events"""
         event_types = {}
@@ -700,13 +773,23 @@ class ScanData:
             modules[module] = modules.get(module, 0) + 1
             scope_distances[scope_dist] = scope_distances.get(scope_dist, 0) + 1
 
+        # Get started_at and format it for display
+        started_at_raw = self._get_scan_data(self.scan_info).get("started_at", "Unknown")
+        if started_at_raw != "Unknown":
+            try:
+                started_at = self._parse_timestamp(started_at_raw).strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                started_at = str(started_at_raw)
+        else:
+            started_at = "Unknown"
+
         return {
             "total_events": len(self.events),
             "event_types": event_types,
             "modules": modules,
             "scope_distances": scope_distances,
             "scan_name": self.scan_name,
-            "started_at": self.scan_info.get("data", {}).get("started_at", "Unknown"),
+            "started_at": started_at,
         }
 
 
@@ -930,7 +1013,7 @@ class VulnerabilitiesTable(DataTable):
 
     def _get_severity(self, vuln: Dict[str, Any]) -> str:
         """Get the severity level of a vulnerability"""
-        return vuln.get("data", {}).get("severity", "UNKNOWN")
+        return self.scan_data._get_event_data(vuln).get("severity", "UNKNOWN")
 
     def _sort_vulnerabilities_by_severity(self) -> None:
         """Sort vulnerabilities by severity (highest first)"""
@@ -950,7 +1033,7 @@ class VulnerabilitiesTable(DataTable):
         display_vulns = self.vulnerabilities[:self.MAX_DISPLAY_ROWS]
 
         for vuln in display_vulns:
-            data = vuln.get("data", {})
+            data = self.scan_data._get_event_data(vuln)
             severity = data.get("severity", "UNKNOWN")
             host = data.get("host", "")
             module = vuln.get("module", "")
@@ -1003,7 +1086,7 @@ class VulnerabilitiesTable(DataTable):
         display_vulns = filtered_vulns[:self.MAX_DISPLAY_ROWS]
 
         for vuln in display_vulns:
-            data = vuln.get("data", {})
+            data = self.scan_data._get_event_data(vuln)
             severity = data.get("severity", "UNKNOWN")
             host = data.get("host", "")
             module = vuln.get("module", "")
@@ -1061,7 +1144,7 @@ class FindingsTable(DataTable):
         display_findings = self.findings[:self.MAX_DISPLAY_ROWS]
 
         for finding in display_findings:
-            data = finding.get("data", {})
+            data = self.scan_data._get_event_data(finding)
             host = data.get("host", "")
             module = finding.get("module", "")
 
@@ -1110,7 +1193,7 @@ class FindingsTable(DataTable):
         display_findings = filtered_findings[:self.MAX_DISPLAY_ROWS]
 
         for finding in display_findings:
-            data = finding.get("data", {})
+            data = self.scan_data._get_event_data(finding)
             host = data.get("host", "")
             module = finding.get("module", "")
 
@@ -1146,8 +1229,9 @@ class FindingDetailView(VerticalScroll):
 
     finding_json = reactive({})
 
-    def __init__(self, **kwargs):
+    def __init__(self, scan_data: ScanData = None, **kwargs):
         super().__init__(**kwargs)
+        self.scan_data = scan_data
 
     def watch_finding_json(self, finding_json: Dict[str, Any]) -> None:
         """React to finding selection changes"""
@@ -1164,7 +1248,12 @@ class FindingDetailView(VerticalScroll):
 
         # Extract key information
         event_type = finding_json.get("type", "UNKNOWN")
-        data = finding_json.get("data", {})
+        # Version-aware data extraction
+        if self.scan_data:
+            data = self.scan_data._get_event_data(finding_json)
+        else:
+            # Fallback for backward compatibility
+            data = finding_json.get("data_json") or finding_json.get("data", {})
 
         # Build plain text content (no Markdown, no special formatting)
         content = f"{event_type}\n\n"
@@ -1270,16 +1359,39 @@ class EventTable(DataTable):
 
         for event in self.filtered_events[:1000]:  # Limit to first 1000 for performance
             event_type = event.get("type", "")
-            data = str(event.get("data", ""))[:50]  # Truncate long data
+            # Get data value for display
+            event_data = self.scan_data._get_event_data(event)
+
+            # Format data based on event type
+            if isinstance(event_data, dict):
+                # For complex events (VULNERABILITY, FINDING, SCAN), show user-friendly summary
+                if event_type == "VULNERABILITY":
+                    severity = event_data.get("severity", "")
+                    desc = event_data.get("description", "")
+                    data = f"{severity}: {desc}"[:50]
+                elif event_type == "FINDING":
+                    name = event_data.get("name", "")
+                    desc = event_data.get("description", "")
+                    data = (name or desc)[:50]
+                else:
+                    # For other dict types, show first value or stringified dict
+                    data = str(event_data)[:50]
+            else:
+                # For simple events, show the value directly
+                data = str(event_data)[:50]
+
             module = event.get("module", "")
             scope = str(event.get("scope_distance", ""))
             timestamp = event.get("timestamp", "")
 
             if timestamp:
                 try:
-                    # Try to parse and format timestamp
+                    # Try to parse and format timestamp (handle both string and numeric formats)
                     if isinstance(timestamp, str):
                         dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        timestamp = dt.strftime("%H:%M:%S")
+                    elif isinstance(timestamp, (int, float)):
+                        dt = datetime.fromtimestamp(timestamp)
                         timestamp = dt.strftime("%H:%M:%S")
                 except:
                     timestamp = str(timestamp)[:10]
@@ -1887,15 +1999,31 @@ class ScanListScreen(Screen):
                             if event.get("type") == "SCAN":
                                 # Check if we already have this one (avoid duplicates)
                                 event_id = event.get("id")
-                                if not any(e.get("id") == event_id and e.get("data", {}).get("status") == event.get("data", {}).get("status") for e in scan_events):
+                                # Version-aware duplicate check
+                                event_data = event.get("data_json") or event.get("data", {})
+                                event_status = event_data.get("status")
+                                if not any(e.get("id") == event_id and (e.get("data_json") or e.get("data", {})).get("status") == event_status for e in scan_events):
                                     scan_events.append(event)
                         except:
                             continue
 
             # Return the SCAN event with the most recent timestamp
             if scan_events:
-                # Sort by timestamp (most recent last)
-                scan_events.sort(key=lambda e: e.get("timestamp", ""), reverse=False)
+                # Sort by timestamp (most recent last) - handle both string and numeric timestamps
+                def get_sort_key(event):
+                    ts = event.get("timestamp", 0)
+                    # Convert string timestamps to comparable numeric values
+                    if isinstance(ts, str):
+                        try:
+                            from datetime import datetime
+                            # Parse ISO 8601 and convert to timestamp
+                            ts_str = ts.replace("+00:00", "")
+                            return datetime.fromisoformat(ts_str).timestamp()
+                        except:
+                            return 0
+                    return ts if isinstance(ts, (int, float)) else 0
+
+                scan_events.sort(key=get_sort_key, reverse=False)
                 return scan_events[-1]  # Return most recent
 
         except:
@@ -2021,7 +2149,9 @@ class ScanListScreen(Screen):
 
                 # Extract scan status from the last SCAN event
                 if scan_event:
-                    scan_status = scan_event.get("data", {}).get("status", "UNKNOWN")
+                    # Version-aware data extraction
+                    scan_data = scan_event.get("data_json") or scan_event.get("data", {})
+                    scan_status = scan_data.get("status", "UNKNOWN")
 
                 # Get event counts
                 # Strategy: Cache ALL counts on initial load (thorough counting)
@@ -2197,10 +2327,12 @@ class ScanListScreen(Screen):
             # Get SCAN event (thorough mode for accuracy)
             scan_event = self._get_last_scan_event(output_json, thorough=True)
 
-            # Extract scan status
+            # Extract scan status (version-aware)
             scan_status = "UNKNOWN"
             if scan_event:
-                scan_status = scan_event.get("data", {}).get("status", "UNKNOWN")
+                # Detect version from scan event and extract data accordingly
+                scan_data = scan_event.get("data_json") or scan_event.get("data", {})
+                scan_status = scan_data.get("status", "UNKNOWN")
 
             # Get event counts (thorough mode)
             event_count, vuln_count, finding_count = self._estimate_event_counts(output_json, thorough=True)
@@ -2261,7 +2393,9 @@ class ScanListScreen(Screen):
                 try:
                     scan_event = self._get_last_scan_event(output_json, thorough=False)
                     if scan_event:
-                        status = scan_event.get("data", {}).get("status", "UNKNOWN")
+                        # Version-aware data extraction
+                        scan_data = scan_event.get("data_json") or scan_event.get("data", {})
+                        status = scan_data.get("status", "UNKNOWN")
                         if status == "RUNNING":
                             # Check if actually running
                             if self._check_active_file_handler(output_json):
@@ -2388,7 +2522,9 @@ class ScanListScreen(Screen):
                 scan_event = self._get_last_scan_event(output_json, thorough=False)
 
                 if scan_event:
-                    current_status = scan_event.get("data", {}).get("status", "UNKNOWN")
+                    # Version-aware data extraction
+                    scan_data = scan_event.get("data_json") or scan_event.get("data", {})
+                    current_status = scan_data.get("status", "UNKNOWN")
 
                     # Only check for active processes if status is RUNNING
                     # Skip expensive checks for FINISHED scans
@@ -2971,7 +3107,7 @@ class ScanViewerScreen(Screen):
                         yield VulnerabilitiesTable(self.scan_data, id="vulnerabilities-table")
 
                     with Vertical(id="vulnerability-detail-container"):
-                        yield FindingDetailView(id="vulnerability-detail")
+                        yield FindingDetailView(scan_data=self.scan_data, id="vulnerability-detail")
 
             with TabPane(findings_label, id="findings"):
                 with Horizontal(id="findings-pane"):
@@ -2993,7 +3129,7 @@ class ScanViewerScreen(Screen):
                         yield FindingsTable(self.scan_data, id="findings-table")
 
                     with Vertical(id="finding-detail-container"):
-                        yield FindingDetailView(id="finding-detail")
+                        yield FindingDetailView(scan_data=self.scan_data, id="finding-detail")
 
             with TabPane("Events", id="events"):
                 with Horizontal(id="events-pane"):
